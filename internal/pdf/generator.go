@@ -42,7 +42,7 @@ func (g *Generator) Generate(lines int) ([]byte, error) {
 		pageIDs[i] = 4 + i*2
 		pageReferences[i] = strconv.Itoa(pageIDs[i]) + " 0 R"
 	}
-	addObject(2, "<< /Type /Pages /Kids ["+strings.Join(pageReferences, " ")+ "] /Count "+strconv.Itoa(pageCount)+" >>")
+	addObject(2, "<< /Type /Pages /Kids ["+strings.Join(pageReferences, " ")+"] /Count "+strconv.Itoa(pageCount)+" >>")
 	addObject(3, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
 
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))

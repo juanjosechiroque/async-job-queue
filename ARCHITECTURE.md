@@ -2,165 +2,98 @@
 
 ## Scope
 
-This document describes only the platform that is currently implemented. The service is a synchronous HTTP API for generating PDFs.
+This document describes the implemented asynchronous PDF service. It does not describe a future queue-based architecture.
 
-The current architecture does not include a queue, worker pool, `jobId`, database, local PDF storage, or a status-query system.
+The service stores job metadata in memory and generated PDFs on the local filesystem. It has no persistent job database, worker pool, configured concurrency limit, or automatic retention policy.
 
 ## Overview
 
 ```text
 HTTP client
     |
-    | POST /job
+    | POST /jobs
     v
 HTTP Server :8080
     |
     v
-job.Handler
-    |
-    v
-job.Service
-    |
-    v
-pdf.Generator
-    |
-    v
-text.Generator
-    |
-    v
-application/pdf
+jobs.Handler -> jobs.Service -> in-memory jobs.Store
+                     |
+                     | one goroutine per accepted job
+                     v
+              pdf.Generator + text.Generator
+                     |
+                     v
+              ./storage/{jobId}.pdf
 ```
 
-## Startup
+## Startup and shutdown
 
-The entry point is `cmd/server/main.go`.
+`cmd/server/main.go` creates `./storage`, wires `text.Generator`, `pdf.Generator`, `jobs.Service`, and `jobs.Handler`, then registers `/jobs` and `/jobs/`.
 
-Dependencies are composed at startup in this order:
+The server handles `SIGINT` and `SIGTERM` as follows:
 
-1. `text.NewGenerator()` creates the text generator.
-2. `pdf.NewGenerator(textGenerator)` creates the PDF generator.
-3. `job.NewService(pdfGenerator)` creates the business service.
-4. `job.NewHandler(jobService)` creates the HTTP handler.
-5. The handler is registered at `/job`.
-6. `http.ListenAndServe(":8080", mux)` starts the server.
+1. Reject new job creation.
+2. Stop accepting new HTTP connections with `http.Server.Shutdown`.
+3. Wait for tracked background jobs to finish, sharing a 30-second deadline with HTTP shutdown.
+4. Exit when jobs finish or the deadline expires.
 
-No environment variables are read and no external connections are initialized.
-
-## Components
-
-### `cmd/server`
-
-Contains dependency wiring and HTTP server startup.
-
-### `internal/job`
-
-Contains the HTTP contract and business validation.
-
-`GenerateRequest` represents the request body:
-
-```go
-type GenerateRequest struct {
-	Lines int `json:"lines"`
-}
-```
-
-`Service.GeneratePDF` validates that `lines` is between 1 and 20,000 before invoking the generator.
-
-### `internal/pdf`
-
-Generates a PDF 1.4 document in memory.
-
-Current characteristics:
-
-- 29 lines per page.
-- Helvetica font.
-- 612 × 792 point page size.
-- Randomly generated text.
-- The result is returned as `[]byte`.
-
-The generator creates a local `rand.Rand` for each generation and builds the PDF objects, pages, `xref` table, and trailer.
-
-### `internal/text`
-
-Maintains a fixed set of sample texts and randomly selects one for each line.
+Job goroutines do not use the originating request context, so an accepted job can continue after its creation response has been sent.
 
 ## HTTP contract
 
-### `POST /job`
+### `POST /jobs`
 
-The handler accepts only the `POST` method.
-
-Request:
-
-```http
-POST /job HTTP/1.1
-Content-Type: application/json
-
-{"lines":10}
-```
-
-Successful response:
-
-```http
-HTTP/1.1 200 OK
-Content-Type: application/pdf
-Content-Disposition: attachment; filename=job-lines-10.pdf
-```
-
-The PDF is written directly to the response body.
-
-## Error handling
-
-The handler uses JSON responses for errors:
+Validates `lines` in `internal/jobs` between 1 and 250,000, creates a `queued` job in the in-memory store, starts its goroutine, and returns `202 Accepted` with:
 
 ```json
 {
-  "error": "message"
+  "jobId": "a8K2mP91xQ",
+  "status": "queued",
+  "downloadUrl": "/jobs/a8K2mP91xQ/file"
 }
 ```
 
-Implemented rules:
+There is no `statusUrl` response field. `POST /job` is not registered.
 
-- Invalid JSON: `400 Bad Request`.
-- Invalid line count: `400 Bad Request`.
-- Method not allowed: `405 Method Not Allowed`.
-- Unexpected generation error: `500 Internal Server Error`.
+### `GET /jobs/{jobId}`
 
-Internal generation details are not exposed to the client; the generic message `could not generate PDF` is returned.
+Returns the job ID and state. A completed job receives its `downloadUrl`; a failed job receives only the client-safe error `job failed` in addition to its ID and state.
 
-## Concurrency and memory
+### `GET /jobs/{jobId}/file`
 
-The application does not create workers or manage its own queue. PDF processing occurs inside the HTTP request.
+Returns a completed PDF as `application/pdf`. Queued and processing jobs return `409`; failed jobs return `500`; unknown jobs return `404`. `storage/` has no public static route.
 
-The complete document is built in memory as `[]byte` before it is written to the response. Therefore:
+## Job lifecycle and storage
 
-- Each active request consumes memory proportional to its PDF size.
-- The application does not define a global concurrency limit.
-- There is no generation-specific backpressure.
-- There is no retry or recovery if the process restarts.
+The in-memory `Store` is a `map[string]Job` protected by `sync.RWMutex`. It tracks this model:
 
-The 20,000-line limit controls the maximum size of an individual request, but it does not impose a global limit on concurrent requests.
+```go
+type Job struct {
+    ID        string
+    Lines     int
+    Status    JobStatus
+    FilePath  string
+    Error     string
+    CreatedAt time.Time
+    UpdatedAt time.Time
+}
+```
 
-## Persistence
+The record never holds PDF bytes. State transitions are:
 
-There is no persistence. The service does not store:
+```text
+queued -> processing -> completed
+                     -> failed
+```
 
-- jobs;
-- statuses;
-- generated PDFs;
-- request history.
+The job runner marks the job `processing`, invokes the existing PDF generator, writes the result to a temporary file in `storage/`, atomically renames it to `{jobId}.pdf`, and only then marks it `completed`. Generation, storage, or recovered-panic failures are marked `failed`; panic details are logged internally.
 
-Once the response is complete, the result is no longer available on the server.
+Job IDs contain exactly 10 Base62 characters and use `crypto/rand`. Before insertion, the service checks the store and retries on an ID collision.
 
-## Known limitations
+## Concurrency and retention
 
-- A request remains open until generation finishes.
-- The client must wait for the PDF on the same connection.
-- There is no `jobId` or later result lookup.
-- The result cannot be recovered after the connection is closed.
-- Memory usage grows with PDF size and the number of concurrent requests.
-- The port is not configurable; it is currently fixed at `:8080`.
-- There is no business logging or metrics.
-- There is no authentication or authorization.
+There is intentionally no application-level concurrency limit: each accepted request starts one goroutine. A `sync.WaitGroup` tracks those goroutines for shutdown.
 
-These are characteristics of the current version, not documentation errors.
+Both the job store and PDFs are retained until manual cleanup. Job state is lost after process restart, while existing storage files remain on disk but cannot be retrieved because no in-memory job metadata exists.
+
+Operational metrics, workload logs, disk-usage monitoring, and pprof exposure are not implemented yet.

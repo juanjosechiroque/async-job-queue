@@ -2,7 +2,7 @@
 
 ## Context
 
-This repository contains a Go HTTP service that generates PDFs synchronously. The current implementation is described in [README.md](README.md) and [ARCHITECTURE.md](ARCHITECTURE.md).
+This repository contains a Go HTTP service that generates PDFs asynchronously. The current implementation is described in [README.md](README.md) and [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Before modifying the project
 
@@ -14,39 +14,42 @@ This repository contains a Go HTTP service that generates PDFs synchronously. Th
 ## Current structure
 
 - `cmd/server`: server startup and dependency wiring.
-- `internal/job`: handler, request model, and business service.
+- `internal/jobs`: handler, request model, and business service.
 - `internal/pdf`: PDF generation.
 - `internal/text`: per-line text generation.
 
 ## Implementation rules
 
 - Prefer the Go standard library before adding external dependencies.
-- Keep validation logic in `internal/job` and generation logic in `internal/pdf`.
+- Keep validation logic in `internal/jobs` and generation logic in `internal/pdf`.
 - Keep HTTP handlers thin: decode the request, invoke the service, and build the response.
 - Validate `lines` before generating the PDF.
-- Keep the allowed range between 1 and 20,000 unless there is an explicit decision to change it.
+- Keep the allowed range between 1 and 250,000.
 - Do not expose internal error details to the client.
 - Escape text correctly before inserting it into the PDF.
 - Do not add a queue, workers, persistent storage, or new endpoints as part of a minor refactor without first updating the architecture and HTTP contract.
 
 ## Current API
 
-The only implemented endpoint is:
+The implemented asynchronous endpoints are:
 
 ```text
-POST /job
+POST /jobs
+GET  /jobs/{id}
+GET  /jobs/{id}/file
 ```
 
-It returns `application/pdf` on success and JSON on error. `POST /jobs`, `GET /jobs/{id}`, and `GET /jobs/{id}/file` are not currently implemented.
+`POST /job` is not implemented. Job creation returns JSON; completed PDF files are returned by `GET /jobs/{id}/file`.
 
 ## Required verification
 
 After modifying Go code:
 
 ```bash
-gofmt -w <modified-go-files>
-go test ./...
+make check
 ```
+
+This runs `gofmt`, `go vet`, and `go test ./... -race`.
 
 When modifying the HTTP endpoint, verify at least:
 
