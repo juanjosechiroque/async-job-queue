@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -88,7 +88,7 @@ type Service struct {
 	pdfGenerator PDFGenerator
 	store        *Store
 	storageDir   string
-	logger       *log.Logger
+	logger       *slog.Logger
 
 	mu        sync.Mutex
 	accepting bool
@@ -100,7 +100,7 @@ func NewService(pdfGenerator PDFGenerator, storageDir string) *Service {
 		pdfGenerator: pdfGenerator,
 		store:        NewStore(),
 		storageDir:   storageDir,
-		logger:       log.Default(),
+		logger:       slog.Default(),
 		accepting:    true,
 	}
 }
@@ -132,6 +132,10 @@ func (s *Service) CreateJob(lines int) (Job, error) {
 		if !s.store.Create(job) {
 			continue
 		}
+		s.logger.Info("job created",
+			slog.String("job_id", job.ID),
+			slog.Int("lines", job.Lines),
+		)
 		s.jobs.Add(1)
 		go s.run(job.ID, lines)
 		return job, nil
@@ -168,27 +172,77 @@ func (s *Service) Wait(ctx context.Context) error {
 
 func (s *Service) run(id string, lines int) {
 	defer s.jobs.Done()
+	processingStarted := time.Now()
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			s.logger.Printf("job id=%s panic=%v", id, recovered)
-			s.store.MarkFailed(id, "job failed")
+			s.logger.Error("job panic recovered",
+				slog.String("job_id", id),
+				slog.Any("panic", recovered),
+			)
+			s.markFailed(id, processingStarted)
 		}
 	}()
 
-	s.store.MarkProcessing(id)
+	if !s.store.MarkProcessing(id) {
+		s.logger.Error("job processing transition failed",
+			slog.String("job_id", id),
+			slog.String("error", "job not found"),
+		)
+		return
+	}
+	processingStarted = time.Now()
+	s.logger.Info("job state transition",
+		slog.String("job_id", id),
+		slog.String("status", string(StatusProcessing)),
+	)
+
 	document, err := s.pdfGenerator.Generate(lines)
 	if err != nil {
-		s.store.MarkFailed(id, "job failed")
+		s.logger.Error("job PDF generation failed",
+			slog.String("job_id", id),
+			slog.Any("error", err),
+		)
+		s.markFailed(id, processingStarted)
 		return
 	}
 	path, err := s.writePDF(id, document)
 	if err != nil {
-		s.store.MarkFailed(id, "job failed")
+		s.logger.Error("job PDF storage failed",
+			slog.String("job_id", id),
+			slog.Any("error", err),
+		)
+		s.markFailed(id, processingStarted)
 		return
 	}
 	if !s.store.MarkCompleted(id, path) {
-		s.store.MarkFailed(id, "job failed")
+		s.logger.Error("job completed transition failed",
+			slog.String("job_id", id),
+			slog.String("error", "job not found"),
+		)
+		s.markFailed(id, processingStarted)
+		return
 	}
+	s.logger.Info("job state transition",
+		slog.String("job_id", id),
+		slog.String("status", string(StatusCompleted)),
+		slog.Duration("generation_duration", time.Since(processingStarted)),
+		slog.Int("pdf_size_bytes", len(document)),
+	)
+}
+
+func (s *Service) markFailed(id string, processingStarted time.Time) {
+	if !s.store.MarkFailed(id, "job failed") {
+		s.logger.Error("job failed transition failed",
+			slog.String("job_id", id),
+			slog.String("error", "job not found"),
+		)
+		return
+	}
+	s.logger.Info("job state transition",
+		slog.String("job_id", id),
+		slog.String("status", string(StatusFailed)),
+		slog.Duration("generation_duration", time.Since(processingStarted)),
+	)
 }
 
 func (s *Service) writePDF(id string, document []byte) (string, error) {
