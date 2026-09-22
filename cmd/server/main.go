@@ -58,7 +58,7 @@ func main() {
 	case received := <-signals:
 		slog.Info("received signal; beginning graceful shutdown", slog.String("signal", received.String()))
 		jobService.StopAccepting()
-		shutdown, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := server.Shutdown(shutdown); err != nil {
 			slog.Error("HTTP shutdown error", slog.Any("error", err))
