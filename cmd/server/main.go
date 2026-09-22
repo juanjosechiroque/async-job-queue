@@ -32,8 +32,8 @@ func main() {
 	mux.Handle("/jobs", jobHandler)
 	mux.Handle("/jobs/", jobHandler)
 
-	server := &http.Server{Addr: ":8080", Handler: mux}
-	pprofServer := &http.Server{Addr: "127.0.0.1:6060", Handler: http.DefaultServeMux}
+	server := &http.Server{Addr: ":8080", Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	pprofServer := &http.Server{Addr: "127.0.0.1:6060", Handler: http.DefaultServeMux, ReadHeaderTimeout: 5 * time.Second}
 	serverErrors := make(chan error, 2)
 	go func() {
 		serverErrors <- server.ListenAndServe()
