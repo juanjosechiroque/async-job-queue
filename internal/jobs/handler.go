@@ -66,6 +66,8 @@ func (h *Handler) createJob(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, ErrShuttingDown):
 			writeJSONError(w, http.StatusServiceUnavailable, "service is shutting down")
+		case errors.Is(err, ErrQueueFull):
+			writeJSONError(w, http.StatusServiceUnavailable, "job queue is full")
 		default:
 			writeJSONError(w, http.StatusInternalServerError, "could not create job")
 		}
