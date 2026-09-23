@@ -30,7 +30,7 @@ A `CreateJob` that passes the accepting check just before shutdown may finish it
 
 Why 10s: shutdown waits only for jobs already in progress. At most 4 run at once, in parallel, so the wait is about one job: ~112ms for the largest (~103ms generation + ~9ms disk write), excluding Postgres round-trips. A local shutdown with jobs in flight exited in under 1s; 10s leaves ample margin for slower production I/O.
 
-Workers don't use the request context — a job keeps running after its `202` is sent.
+Workers don't use the request context — a job keeps running after its `202` is sent. Polling and claiming use a service lifetime context canceled at shutdown. Once a job is claimed, its generation is not canceled, and final `completed`/`failed` writes use a context detached from shutdown cancellation; the Postgres store still limits each operation to five seconds so those writes can finish during the shutdown wait window.
 
 ## Rate limiting
 
@@ -47,7 +47,7 @@ type Job struct {
 }
 ```
 
-`jobs.JobStore` abstracts metadata storage: `postgres.Store` (pgxpool) in the server, `jobs.Store` (in-memory) for fast unit tests. The embedded schema creates the `jobs` table and a `(status, created_at)` index matching the claim query. PDF bytes never live in the record.
+`jobs.JobStore` abstracts metadata storage with context-aware operations and explicit errors: `postgres.Store` (pgxpool) in the server, `jobs.Store` (in-memory) for fast unit tests. A missing row is `ErrJobNotFound`; database errors remain errors and are not treated as missing jobs. The embedded schema creates the `jobs` table and a `(status, created_at)` index matching the claim query. PDF bytes never live in the record.
 
 ID: 10-char Base62, `crypto/rand`, collision-checked on insert.
 
@@ -87,6 +87,7 @@ Load: `hey -c 100 -n 100 -m POST -d '{"lines":250000}' localhost:8080/jobs`, `pp
 | `503` when the queue is full, instead of blocking | A blocked request has no bound of its own and gives the client no retry signal | Clients must retry |
 | Advisory lock on job creation | Count + insert cannot race past the 100 cap, even across processes; request goroutines do not hold the service mutex during database I/O | All job creation serializes on one database lock |
 | In-flight creation may finish after shutdown starts | The database insert is outside the service mutex; the existing Postgres transaction still enforces capacity | A final `queued` row may wait for the next process to start |
+| Final job-state writes detach from shutdown cancellation | A claimed job continues to completion and its final database update can finish while `Wait` is active; each Postgres operation remains capped at five seconds | Shutdown may wait for an in-flight store write until its operation timeout |
 | Socket IP, not `X-Forwarded-For` | The header is spoofable without a trusted-proxy hop count | Behind a proxy, every client looks like one IP |
 | PDFs on local disk, metadata in Postgres | Keeps large blobs out of the database | Files are not shared across instances (below) |
 

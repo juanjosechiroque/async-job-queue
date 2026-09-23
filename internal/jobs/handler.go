@@ -1,25 +1,28 @@
 package jobs
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
 )
 
 type JobService interface {
-	CreateJob(lines int) (Job, error)
-	GetJob(id string) (Job, error)
+	CreateJob(context.Context, int) (Job, error)
+	GetJob(context.Context, string) (Job, error)
 }
 
 type Handler struct {
 	service JobService
+	logger  *slog.Logger
 }
 
 func NewHandler(service JobService) *Handler {
-	return &Handler{service: service}
+	return &Handler{service: service, logger: slog.Default()}
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -63,7 +66,7 @@ func (h *Handler) createJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	job, err := h.service.CreateJob(request.Lines)
+	job, err := h.service.CreateJob(r.Context(), request.Lines)
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrInvalidLineCount):
@@ -72,7 +75,10 @@ func (h *Handler) createJob(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusServiceUnavailable, "service is shutting down")
 		case errors.Is(err, ErrQueueFull):
 			writeJSONError(w, http.StatusServiceUnavailable, "job queue is full")
+		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+			writeJSONError(w, http.StatusServiceUnavailable, "request could not be completed")
 		default:
+			h.logger.Error("create job failed", slog.Any("error", err))
 			writeJSONError(w, http.StatusInternalServerError, "could not create job")
 		}
 		return
@@ -90,13 +96,13 @@ func (h *Handler) readJob(w http.ResponseWriter, r *http.Request, id string) {
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	job, err := h.service.GetJob(id)
+	job, err := h.service.GetJob(r.Context(), id)
 	if errors.Is(err, ErrJobNotFound) {
 		writeJSONError(w, http.StatusNotFound, "job not found")
 		return
 	}
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "could not read job")
+		h.writeStoreError(w, id, err)
 		return
 	}
 
@@ -115,13 +121,13 @@ func (h *Handler) downloadFile(w http.ResponseWriter, r *http.Request, id string
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	job, err := h.service.GetJob(id)
+	job, err := h.service.GetJob(r.Context(), id)
 	if errors.Is(err, ErrJobNotFound) {
 		writeJSONError(w, http.StatusNotFound, "job not found")
 		return
 	}
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "could not read job")
+		h.writeStoreError(w, id, err)
 		return
 	}
 
@@ -150,6 +156,15 @@ func (h *Handler) downloadFile(w http.ResponseWriter, r *http.Request, id string
 	default:
 		writeJSONError(w, http.StatusInternalServerError, "could not retrieve PDF")
 	}
+}
+
+func (h *Handler) writeStoreError(w http.ResponseWriter, id string, err error) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		writeJSONError(w, http.StatusServiceUnavailable, "request could not be completed")
+		return
+	}
+	h.logger.Error("read job failed", slog.String("job_id", id), slog.Any("error", err))
+	writeJSONError(w, http.StatusInternalServerError, "could not read job")
 }
 
 func validID(id string) bool {

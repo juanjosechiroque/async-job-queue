@@ -2,9 +2,11 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -37,20 +39,21 @@ func TestStoreClaimQueuedDoesNotDuplicateClaims(t *testing.T) {
 	for index := range jobCount {
 		id := fmt.Sprintf("itclaim%03d", index)
 		ids[id] = struct{}{}
-		store.Delete(id)
-		if !store.Create(jobs.Job{
+		deleteJob(t, store, id)
+		created, err := store.CreateQueued(context.Background(), jobs.Job{
 			ID:        id,
 			Lines:     1,
 			Status:    jobs.StatusQueued,
 			CreatedAt: now,
 			UpdatedAt: now,
-		}) {
-			t.Fatalf("Create(%q) = false, want true", id)
+		}, 100)
+		if err != nil || !created {
+			t.Fatalf("CreateQueued(%q) = (%t, %v), want (true, nil)", id, created, err)
 		}
 	}
 	t.Cleanup(func() {
 		for id := range ids {
-			store.Delete(id)
+			deleteJob(t, store, id)
 		}
 	})
 
@@ -102,6 +105,86 @@ func TestStoreClaimQueuedDoesNotDuplicateClaims(t *testing.T) {
 	}
 }
 
+func TestStoreCreateQueuedAdvisoryLockEnforcesCapacity(t *testing.T) {
+	databaseURL := integrationDatabaseURL(t)
+	ensureNoQueuedJobs(t, databaseURL)
+	store := newIntegrationStore(t, databaseURL)
+	const callers = 120
+	now := time.Now().UTC()
+	ids := make([]string, callers)
+	for i := range callers {
+		ids[i] = fmt.Sprintf("itcap%05d", i)
+	}
+	t.Cleanup(func() {
+		for _, id := range ids {
+			deleteJob(t, store, id)
+		}
+	})
+
+	start := make(chan struct{})
+	var workers sync.WaitGroup
+	var createdCount atomic.Int32
+	var fullCount atomic.Int32
+	var unexpected atomic.Int32
+	for i := range callers {
+		workers.Add(1)
+		go func(i int) {
+			defer workers.Done()
+			<-start
+			created, err := store.CreateQueued(context.Background(), jobs.Job{
+				ID: ids[i], Lines: 1, Status: jobs.StatusQueued, CreatedAt: now, UpdatedAt: now,
+			}, 100)
+			switch {
+			case err == nil && created:
+				createdCount.Add(1)
+			case errors.Is(err, jobs.ErrQueueFull):
+				fullCount.Add(1)
+			default:
+				unexpected.Add(1)
+			}
+		}(i)
+	}
+	close(start)
+	workers.Wait()
+	if got := createdCount.Load(); got != 100 {
+		t.Errorf("created jobs = %d, want 100", got)
+	}
+	if got := fullCount.Load(); got != callers-100 {
+		t.Errorf("queue full errors = %d, want %d", got, callers-100)
+	}
+	if got := unexpected.Load(); got != 0 {
+		t.Errorf("unexpected store results = %d", got)
+	}
+}
+
+func TestStoreNotFoundAndContextErrors(t *testing.T) {
+	databaseURL := integrationDatabaseURL(t)
+	store := newIntegrationStore(t, databaseURL)
+	const id = "itmissng01"
+	deleteJob(t, store, id)
+	if _, err := store.Get(context.Background(), id); !errors.Is(err, jobs.ErrJobNotFound) {
+		t.Errorf("Get() error = %v, want ErrJobNotFound", err)
+	}
+	if err := store.MarkCompleted(context.Background(), id, "missing.pdf"); !errors.Is(err, jobs.ErrJobNotFound) {
+		t.Errorf("MarkCompleted() error = %v, want ErrJobNotFound", err)
+	}
+	if err := store.MarkFailed(context.Background(), id, "failed"); !errors.Is(err, jobs.ErrJobNotFound) {
+		t.Errorf("MarkFailed() error = %v, want ErrJobNotFound", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := store.Get(ctx, id); !errors.Is(err, context.Canceled) {
+		t.Errorf("Get(canceled) error = %v, want context.Canceled", err)
+	}
+	if created, err := store.CreateQueued(ctx, jobs.Job{ID: id, Status: jobs.StatusQueued}, 100); created || !errors.Is(err, context.Canceled) {
+		t.Errorf("CreateQueued(canceled) = (%t, %v), want (false, context.Canceled)", created, err)
+	}
+	if _, claimed, err := store.ClaimQueued(ctx); claimed || !errors.Is(err, context.Canceled) {
+		t.Errorf("ClaimQueued(canceled) = (claimed %t, %v), want (false, context.Canceled)", claimed, err)
+	}
+}
+
 func TestServiceShutdownWaitsOnlyForWorkClaimedByItsWorkers(t *testing.T) {
 	databaseURL := integrationDatabaseURL(t)
 	ensureNoQueuedJobs(t, databaseURL)
@@ -111,15 +194,15 @@ func TestServiceShutdownWaitsOnlyForWorkClaimedByItsWorkers(t *testing.T) {
 	var ids []string
 	t.Cleanup(func() {
 		for _, id := range ids {
-			storeA.Delete(id)
+			deleteJob(t, storeA, id)
 		}
 	})
 
 	started := make(chan struct{}, 1)
 	release := make(chan struct{})
-	serviceA := jobs.NewServiceWithStore(blockingGenerator{started: started, release: release}, t.TempDir(), 1, storeA)
+	serviceA := jobs.NewService(blockingGenerator{started: started, release: release}, t.TempDir(), 1, storeA)
 
-	first, err := serviceA.CreateJob(1)
+	first, err := serviceA.CreateJob(context.Background(), 1)
 	if err != nil {
 		t.Fatalf("A.CreateJob() first job error = %v", err)
 	}
@@ -129,17 +212,17 @@ func TestServiceShutdownWaitsOnlyForWorkClaimedByItsWorkers(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("A did not start its first job")
 	}
-	second, err := serviceA.CreateJob(1)
+	second, err := serviceA.CreateJob(context.Background(), 1)
 	if err != nil {
 		t.Fatalf("A.CreateJob() second job error = %v", err)
 	}
-	third, err := serviceA.CreateJob(1)
+	third, err := serviceA.CreateJob(context.Background(), 1)
 	if err != nil {
 		t.Fatalf("A.CreateJob() third job error = %v", err)
 	}
 	ids = append(ids, second.ID, third.ID)
 
-	serviceB := jobs.NewServiceWithStore(immediateGenerator{}, t.TempDir(), 1, storeB)
+	serviceB := jobs.NewService(immediateGenerator{}, t.TempDir(), 1, storeB)
 	waitForCompletedJob(t, serviceB, second.ID)
 	waitForCompletedJob(t, serviceB, third.ID)
 	stopAndWait(t, serviceB, time.Second)
@@ -162,14 +245,14 @@ func TestNewServiceClaimsJobQueuedByStoppedInstance(t *testing.T) {
 	var ids []string
 	t.Cleanup(func() {
 		for _, id := range ids {
-			storeA.Delete(id)
+			deleteJob(t, storeA, id)
 		}
 	})
 
 	started := make(chan struct{}, 1)
 	release := make(chan struct{})
-	serviceA := jobs.NewServiceWithStore(blockingGenerator{started: started, release: release}, t.TempDir(), 1, storeA)
-	first, err := serviceA.CreateJob(1)
+	serviceA := jobs.NewService(blockingGenerator{started: started, release: release}, t.TempDir(), 1, storeA)
+	first, err := serviceA.CreateJob(context.Background(), 1)
 	if err != nil {
 		t.Fatalf("A.CreateJob() first job error = %v", err)
 	}
@@ -179,7 +262,7 @@ func TestNewServiceClaimsJobQueuedByStoppedInstance(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("A did not start its first job")
 	}
-	queued, err := serviceA.CreateJob(1)
+	queued, err := serviceA.CreateJob(context.Background(), 1)
 	if err != nil {
 		t.Fatalf("A.CreateJob() queued job error = %v", err)
 	}
@@ -189,7 +272,7 @@ func TestNewServiceClaimsJobQueuedByStoppedInstance(t *testing.T) {
 	close(release)
 	stopAndWait(t, serviceA, time.Second)
 
-	leftBehind, err := serviceA.GetJob(queued.ID)
+	leftBehind, err := serviceA.GetJob(context.Background(), queued.ID)
 	if err != nil {
 		t.Fatalf("A.GetJob(%q) error = %v", queued.ID, err)
 	}
@@ -197,7 +280,7 @@ func TestNewServiceClaimsJobQueuedByStoppedInstance(t *testing.T) {
 		t.Fatalf("A.GetJob(%q) status = %q, want %q", queued.ID, leftBehind.Status, jobs.StatusQueued)
 	}
 
-	serviceB := jobs.NewServiceWithStore(immediateGenerator{}, t.TempDir(), 1, storeB)
+	serviceB := jobs.NewService(immediateGenerator{}, t.TempDir(), 1, storeB)
 	waitForCompletedJob(t, serviceB, queued.ID)
 	stopAndWait(t, serviceB, time.Second)
 }
@@ -252,11 +335,18 @@ func ensureNoQueuedJobs(t *testing.T, databaseURL string) {
 	}
 }
 
+func deleteJob(t *testing.T, store *Store, id string) {
+	t.Helper()
+	if _, err := store.pool.Exec(context.Background(), "DELETE FROM jobs WHERE id = $1", id); err != nil {
+		t.Fatalf("delete job %q: %v", id, err)
+	}
+}
+
 func waitForTerminalJob(t *testing.T, service *jobs.Service, id string) jobs.Job {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		job, err := service.GetJob(id)
+		job, err := service.GetJob(context.Background(), id)
 		if err != nil {
 			t.Fatalf("GetJob(%q) error = %v", id, err)
 		}
