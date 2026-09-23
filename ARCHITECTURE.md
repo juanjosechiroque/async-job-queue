@@ -1,6 +1,6 @@
 # Architecture
 
-Describes implemented behavior only, not a plan. In-memory job metadata, PDFs on local disk, no database.
+Describes implemented behavior only, not a plan. Job metadata is in Postgres; PDFs are local files.
 
 ## Overview
 
@@ -8,11 +8,12 @@ Describes implemented behavior only, not a plan. In-memory job metadata, PDFs on
 Client
   |  POST /jobs
   v
-:8080 -> rate limiter (10/IP/min, 100/IP/hour) -> Handler -> Service -> Store (in-memory)
+:8080 -> rate limiter (10/IP/min, 100/IP/hour) -> Handler -> Service -> Postgres jobs table
                                                                   |
-                                                        bounded queue (100)
+                                                  4 polling workers claim queued rows
+                                                  (FOR UPDATE SKIP LOCKED; 200ms idle poll)
                                                                   |
-                                                          4 workers -> PDF generator -> ./storage/{id}.pdf
+                                                        PDF generator -> ./storage/{id}.pdf
 ```
 
 ## Startup / shutdown
@@ -22,7 +23,7 @@ Client
 On `SIGINT`/`SIGTERM`:
 1. Stop accepting new jobs.
 2. Shut down both HTTP servers.
-3. Close the queue — workers drain in-flight jobs, then exit.
+3. Workers keep claiming queued jobs and drain locally-created work, then exit.
 4. Wait up to 10s for jobs to finish, then exit.
 
 A full 100-job queue at the largest allowed size (250,000 lines) drains in ~2.8s measured (4 workers, ~103ms generation + ~9ms disk write per job) — 10s leaves ~3.5x margin for production I/O the local benchmark doesn't capture.
@@ -44,7 +45,7 @@ type Job struct {
 }
 ```
 
-`Store` = `map[string]Job` + `sync.RWMutex`. PDF bytes never live in the record.
+`internal/jobs.JobStore` abstracts metadata operations. `internal/postgres.Store` is used by the server through `pgxpool`; `internal/jobs.Store` remains an in-memory implementation used by fast unit tests. The embedded SQL schema creates the `jobs` table and `(status, created_at)` claim index. PDF bytes never live in the record.
 
 ID: 10-char Base62, `crypto/rand`, collision-checked on insert.
 
@@ -52,13 +53,19 @@ Write path: generate -> temp file -> atomic rename -> mark `completed`. No parti
 
 ## Concurrency
 
-4 long-lived workers read from a channel buffered for 100 jobs — at most 4 PDF generations run at once. This bounds peak memory during a burst, not per-job wait time: even the largest allowed PDF (250,000 lines) generates in ~100ms, so a full queue drains in a few seconds either way — see "Measured impact" for why the memory bound still matters at this speed.
+4 long-lived workers poll Postgres while idle (every 200ms) and atomically claim a queued row using `SELECT ... FOR UPDATE SKIP LOCKED`, changing it to `processing` in the same transaction. At most 4 PDF generations run at once per service process. `SKIP LOCKED` makes the claim safe across concurrent workers and multiple service processes using the same database: a row locked by one claimant is unavailable to the others.
 
-`CreateJob` enqueues non-blocking: a full queue returns `ErrQueueFull` (`503`) immediately, job not persisted, rather than leaving the request hanging until space frees up — an indefinite wait has no bound of its own and gives the client no clear signal to retry.
+`CreateJob` inserts through a transaction that serializes the queued-row count and insert. A count at or above 100 returns `ErrQueueFull` (`503`) immediately and does not persist the job, rather than leaving the request hanging until space frees up.
 
 `jobQueueCapacity = 100` is an unvalidated starting value: generation is fast enough (~100ms worst case, 4 workers) that 100 queued jobs drain in under 3 seconds, too quick to have ever pressure-tested the number. A slower, I/O-bound generator (real rendering, disk, or network calls) would need to remeasure it.
 
-Single-instance only: the queue and rate limiter are both in-memory, nothing coordinates state across replicas.
+The persisted queue can be consumed by multiple instances safely. This local setup starts one instance only. The rate limiter remains in-memory and is not shared across replicas.
+
+## Persistence and retention
+
+`DATABASE_URL` is read once at startup. Startup fails fast if it is absent or if the initial Postgres connection/schema application fails. `docker compose up -d --wait` starts the local Postgres service with a named data volume; its job records survive server and Compose restarts.
+
+Completed PDFs are still local files in `storage/`. There is intentionally no file or database-record retention process. This manual file-retention concern is more important now that job records persist; implementing cleanup is explicitly out of scope.
 
 ## Observability
 

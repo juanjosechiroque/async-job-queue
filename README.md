@@ -4,13 +4,17 @@
 
 Go service that generates PDFs asynchronously. `POST /jobs` returns immediately; poll for status, download when done.
 
+The workload models report/invoice generation — `lines` stands in for how much content a real report would have.
+
 ## Status
 
-In-memory job store, 4-worker pool, 100-job bounded queue. Full queue returns `503`. Job creation is rate limited per IP with token buckets (10/min, 100/hour) — `429` beyond that. No database, no auto file cleanup.
+Postgres-backed job metadata, 4 polling workers, 100-job bounded queue. Full queue returns `503`. Job creation is rate limited per IP with token buckets (10/min, 100/hour) — `429` beyond that. No automatic file or record cleanup.
 
 ## Run
 
 ```bash
+docker compose up -d --wait
+export DATABASE_URL='postgres://async_job_queue:async_job_queue@localhost:5432/async_job_queue?sslmode=disable'
 go run ./cmd/server
 ```
 
@@ -18,7 +22,7 @@ go run ./cmd/server
 - pprof (debug only, not public): `http://127.0.0.1:6060/debug/pprof/`
 - `Ctrl+C` for graceful shutdown — drains the queue, 10s timeout.
 
-Requires Go 1.27+ (`go.mod`). No env vars, no external services.
+Requires Go 1.27+ (`go.mod`), Docker Compose for local Postgres, and `DATABASE_URL`. The Compose volume is named, so database data survives `docker compose down` and a later `up` (use `down -v` to remove it).
 
 ## API
 
@@ -80,10 +84,11 @@ curl localhost:8080/jobs/{id}/file -o result.pdf
 
 ## Notes
 
-- Job state is in-memory only — lost on restart. Existing PDF files stay in `storage/` but become unreachable.
+- Job records persist in Postgres across server restarts. Workers claim queued rows with `SELECT ... FOR UPDATE SKIP LOCKED`, so concurrent workers — including workers from multiple server instances — cannot process the same queued job twice.
+- PDFs remain files under `storage/`. Retention/cleanup of those files is a manual concern, now more important because job records persist; cleanup of files or records remains explicitly out of scope.
 - No idempotency: identical requests create separate jobs.
 - Files write atomically (temp file + rename) — no partial PDF is ever served.
-- Rate limits and the job queue are per-process, not shared across replicas.
+- Rate limits are per-process. Queue capacity and job claims are shared through Postgres.
 
 ## Verify
 
@@ -97,7 +102,8 @@ CI runs the same checks on every push/PR to `main`.
 
 ```text
 cmd/server/main.go   server startup, shutdown
-internal/jobs/       handler, service, store
+internal/jobs/       handler, service, JobStore interface, in-memory store
+internal/postgres/   pgxpool-backed JobStore and embedded schema
 internal/ratelimit/  per-IP rate limiting middleware
 internal/pdf/        PDF generation
 internal/text/       filler text

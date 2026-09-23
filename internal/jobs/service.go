@@ -28,6 +28,21 @@ type PDFGenerator interface {
 	Generate(lines int) ([]byte, error)
 }
 
+// JobStore holds job metadata. Generated PDF bytes remain on the filesystem.
+// The basic methods intentionally match Store so the in-memory implementation
+// remains a fast test double. CreateQueued and ClaimQueued provide the atomic
+// queue operations needed by a persistent store.
+type JobStore interface {
+	Create(Job) bool
+	Delete(string)
+	Get(string) (Job, bool)
+	MarkProcessing(string) bool
+	MarkCompleted(string, string) bool
+	MarkFailed(string, string) bool
+	CreateQueued(context.Context, Job, int) (bool, error)
+	ClaimQueued(context.Context) (Job, bool, error)
+}
+
 // Store holds metadata only. The generated PDF remains on the filesystem.
 type Store struct {
 	mu   sync.RWMutex
@@ -93,35 +108,89 @@ func (s *Store) MarkFailed(id, message string) bool {
 	})
 }
 
+// CreateQueued creates a job only when fewer than capacity jobs are queued.
+// Holding the mutex for both operations mirrors the transactional Postgres
+// implementation and keeps the in-memory store useful in unit tests.
+func (s *Store) CreateQueued(_ context.Context, job Job, capacity int) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	queued := 0
+	for _, existing := range s.jobs {
+		if existing.Status == StatusQueued {
+			queued++
+		}
+	}
+	if queued >= capacity {
+		return false, ErrQueueFull
+	}
+	if _, exists := s.jobs[job.ID]; exists {
+		return false, nil
+	}
+	s.jobs[job.ID] = job
+	return true, nil
+}
+
+// ClaimQueued atomically transitions one queued job to processing.
+func (s *Store) ClaimQueued(_ context.Context) (Job, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, job := range s.jobs {
+		if job.Status != StatusQueued {
+			continue
+		}
+		job.Status = StatusProcessing
+		job.UpdatedAt = time.Now().UTC()
+		s.jobs[id] = job
+		return job, true, nil
+	}
+	return Job{}, false, nil
+}
+
 type Service struct {
 	pdfGenerator PDFGenerator
-	store        *Store
-	storageDir   string
-	logger       *slog.Logger
+	// store is retained for the existing in-memory tests. Service operations
+	// use jobStore so production can use any JobStore implementation.
+	store      *Store
+	jobStore   JobStore
+	storageDir string
+	logger     *slog.Logger
 
 	mu        sync.Mutex
 	accepting bool
-	queue     chan jobRequest
+	stopping  bool
+	tracked   map[string]struct{}
+	wake      chan struct{}
 	jobs      sync.WaitGroup
 }
 
-type jobRequest struct {
-	id    string
-	lines int
+func NewService(pdfGenerator PDFGenerator, storageDir string, workers int) *Service {
+	store := NewStore()
+	return newService(pdfGenerator, storageDir, workers, store, store)
 }
 
-func NewService(pdfGenerator PDFGenerator, storageDir string, workers int) *Service {
+// NewServiceWithStore constructs a service backed by store. It is used by the
+// server with Postgres while NewService continues to use Store for unit tests.
+func NewServiceWithStore(pdfGenerator PDFGenerator, storageDir string, workers int, store JobStore) *Service {
+	return newService(pdfGenerator, storageDir, workers, nil, store)
+}
+
+func newService(pdfGenerator PDFGenerator, storageDir string, workers int, memoryStore *Store, store JobStore) *Service {
 	if workers < 1 {
 		panic("workers must be at least 1")
+	}
+	if store == nil {
+		panic("job store must not be nil")
 	}
 
 	service := &Service{
 		pdfGenerator: pdfGenerator,
-		store:        NewStore(),
+		store:        memoryStore,
+		jobStore:     store,
 		storageDir:   storageDir,
 		logger:       slog.Default(),
 		accepting:    true,
-		queue:        make(chan jobRequest, jobQueueCapacity),
+		tracked:      make(map[string]struct{}),
+		wake:         make(chan struct{}, 1),
 	}
 	for range workers {
 		go service.worker()
@@ -153,27 +222,29 @@ func (s *Service) CreateJob(lines int) (Job, error) {
 			CreatedAt: now,
 			UpdatedAt: now,
 		}
-		if !s.store.Create(job) {
+		created, err := s.jobStore.CreateQueued(context.Background(), job, jobQueueCapacity)
+		if errors.Is(err, ErrQueueFull) {
+			return Job{}, ErrQueueFull
+		}
+		if err != nil {
+			return Job{}, fmt.Errorf("store queued job: %w", err)
+		}
+		if !created {
 			continue
 		}
 		s.jobs.Add(1)
-		select {
-		case s.queue <- jobRequest{id: job.ID, lines: lines}:
-			s.logger.Info("job created",
-				slog.String("job_id", job.ID),
-				slog.Int("lines", job.Lines),
-			)
-			return job, nil
-		default:
-			s.jobs.Done()
-			s.store.Delete(job.ID)
-			return Job{}, ErrQueueFull
-		}
+		s.tracked[job.ID] = struct{}{}
+		s.signalWorker()
+		s.logger.Info("job created",
+			slog.String("job_id", job.ID),
+			slog.Int("lines", job.Lines),
+		)
+		return job, nil
 	}
 }
 
 func (s *Service) GetJob(id string) (Job, error) {
-	job, ok := s.store.Get(id)
+	job, ok := s.jobStore.Get(id)
 	if !ok {
 		return Job{}, ErrJobNotFound
 	}
@@ -187,7 +258,8 @@ func (s *Service) StopAccepting() {
 		return
 	}
 	s.accepting = false
-	close(s.queue)
+	s.stopping = true
+	s.signalWorker()
 }
 
 func (s *Service) Wait(ctx context.Context) error {
@@ -204,60 +276,55 @@ func (s *Service) Wait(ctx context.Context) error {
 	}
 }
 
-func (s *Service) run(id string, lines int) {
-	defer s.jobs.Done()
+func (s *Service) run(job Job, tracked bool) {
+	if tracked {
+		defer s.finishTracked(job.ID)
+	}
 	processingStarted := time.Now()
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			s.logger.Error("job panic recovered",
-				slog.String("job_id", id),
+				slog.String("job_id", job.ID),
 				slog.Any("panic", recovered),
 			)
-			s.markFailed(id, processingStarted)
+			s.markFailed(job.ID, processingStarted)
 		}
 	}()
 
-	if !s.store.MarkProcessing(id) {
-		s.logger.Error("job processing transition failed",
-			slog.String("job_id", id),
-			slog.String("error", "job not found"),
-		)
-		return
-	}
 	processingStarted = time.Now()
 	s.logger.Info("job state transition",
-		slog.String("job_id", id),
+		slog.String("job_id", job.ID),
 		slog.String("status", string(StatusProcessing)),
 	)
 
-	document, err := s.pdfGenerator.Generate(lines)
+	document, err := s.pdfGenerator.Generate(job.Lines)
 	if err != nil {
 		s.logger.Error("job PDF generation failed",
-			slog.String("job_id", id),
+			slog.String("job_id", job.ID),
 			slog.Any("error", err),
 		)
-		s.markFailed(id, processingStarted)
+		s.markFailed(job.ID, processingStarted)
 		return
 	}
-	path, err := s.writePDF(id, document)
+	path, err := s.writePDF(job.ID, document)
 	if err != nil {
 		s.logger.Error("job PDF storage failed",
-			slog.String("job_id", id),
+			slog.String("job_id", job.ID),
 			slog.Any("error", err),
 		)
-		s.markFailed(id, processingStarted)
+		s.markFailed(job.ID, processingStarted)
 		return
 	}
-	if !s.store.MarkCompleted(id, path) {
+	if !s.jobStore.MarkCompleted(job.ID, path) {
 		s.logger.Error("job completed transition failed",
-			slog.String("job_id", id),
+			slog.String("job_id", job.ID),
 			slog.String("error", "job not found"),
 		)
-		s.markFailed(id, processingStarted)
+		s.markFailed(job.ID, processingStarted)
 		return
 	}
 	s.logger.Info("job state transition",
-		slog.String("job_id", id),
+		slog.String("job_id", job.ID),
 		slog.String("status", string(StatusCompleted)),
 		slog.Duration("generation_duration", time.Since(processingStarted)),
 		slog.Int("pdf_size_bytes", len(document)),
@@ -265,13 +332,40 @@ func (s *Service) run(id string, lines int) {
 }
 
 func (s *Service) worker() {
-	for job := range s.queue {
-		s.run(job.id, job.lines)
+	var tick <-chan time.Time
+	var ticker *time.Ticker
+	// In-memory jobs are always signalled by CreateJob. Postgres also polls so
+	// a newly started process discovers jobs persisted by an earlier process.
+	if s.store == nil {
+		ticker = time.NewTicker(200 * time.Millisecond)
+		tick = ticker.C
+		defer ticker.Stop()
+	} else {
+		// Do not inspect the in-memory map until a service-created job wakes us.
+		// This retains the direct Store setup behavior used by the unit tests.
+		<-s.wake
+	}
+	for {
+		job, claimed, err := s.jobStore.ClaimQueued(context.Background())
+		if err != nil {
+			s.logger.Error("claim queued job", slog.Any("error", err))
+		} else if claimed {
+			s.run(job, s.isTracked(job.ID))
+			continue
+		}
+
+		if s.shouldStopWorker() {
+			return
+		}
+		select {
+		case <-tick:
+		case <-s.wake:
+		}
 	}
 }
 
 func (s *Service) markFailed(id string, processingStarted time.Time) {
-	if !s.store.MarkFailed(id, "job failed") {
+	if !s.jobStore.MarkFailed(id, "job failed") {
 		s.logger.Error("job failed transition failed",
 			slog.String("job_id", id),
 			slog.String("error", "job not found"),
@@ -283,6 +377,34 @@ func (s *Service) markFailed(id string, processingStarted time.Time) {
 		slog.String("status", string(StatusFailed)),
 		slog.Duration("generation_duration", time.Since(processingStarted)),
 	)
+}
+
+func (s *Service) signalWorker() {
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Service) isTracked(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.tracked[id]
+	return ok
+}
+
+func (s *Service) finishTracked(id string) {
+	s.mu.Lock()
+	delete(s.tracked, id)
+	s.mu.Unlock()
+	s.jobs.Done()
+	s.signalWorker()
+}
+
+func (s *Service) shouldStopWorker() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stopping && len(s.tracked) == 0
 }
 
 func (s *Service) writePDF(id string, document []byte) (string, error) {
