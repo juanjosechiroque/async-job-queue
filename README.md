@@ -8,7 +8,7 @@ The workload models report/invoice generation — `lines` stands in for how much
 
 ## Status
 
-Postgres-backed job metadata, 4 polling workers, 100-job bounded queue. Full queue returns `503`. Job creation is rate limited per IP with token buckets (10/min, 100/hour) — `429` beyond that. No automatic file or record cleanup.
+Postgres-backed job metadata, 4 polling workers, 100-job bounded queue (`503` when full), per-IP rate limit on job creation (10/min, 100/hour, `429` beyond). No file or record cleanup. Design, measurements, and known limitations: [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Run
 
@@ -20,9 +20,9 @@ go run ./cmd/server
 
 - API: `http://localhost:8080`
 - pprof (debug only, not public): `http://127.0.0.1:6060/debug/pprof/`
-- `Ctrl+C` for graceful shutdown — drains the queue, 10s timeout.
+- `Ctrl+C` stops new claims, lets jobs already in progress finish (10s timeout), and leaves queued jobs for the next start.
 
-Requires Go 1.27+ (`go.mod`), Docker Compose for local Postgres, and `DATABASE_URL`. The Compose volume is named, so database data survives `docker compose down` and a later `up` (use `down -v` to remove it).
+Requires Go 1.27+ and Docker Compose. Database data survives `docker compose down`; use `down -v` to wipe it.
 
 ## API
 
@@ -84,11 +84,10 @@ curl localhost:8080/jobs/{id}/file -o result.pdf
 
 ## Notes
 
-- Job records persist in Postgres across server restarts. Workers claim queued rows with `SELECT ... FOR UPDATE SKIP LOCKED`, so concurrent workers — including workers from multiple server instances — cannot process the same queued job twice.
-- PDFs remain files under `storage/`. Retention/cleanup of those files is a manual concern, now more important because job records persist; cleanup of files or records remains explicitly out of scope.
+- Job records persist across restarts. Workers claim rows with `FOR UPDATE SKIP LOCKED`, so no job is processed twice, even across instances. Running several instances has caveats — see Known limitations in [ARCHITECTURE.md](ARCHITECTURE.md).
+- PDFs are files under `storage/`. There is no retention or cleanup for files or records.
 - No idempotency: identical requests create separate jobs.
-- Files write atomically (temp file + rename) — no partial PDF is ever served.
-- Rate limits are per-process. Queue capacity and job claims are shared through Postgres.
+- PDFs are written atomically (temp file + rename), so a partial file is never served.
 
 ## Verify
 
@@ -96,7 +95,7 @@ curl localhost:8080/jobs/{id}/file -o result.pdf
 make check   # fmt, vet, race-enabled tests
 ```
 
-CI runs the same checks on every push/PR to `main`.
+The Postgres integration test runs when `DATABASE_URL` is set (e.g. after `docker compose up -d --wait`) and is skipped otherwise. CI runs everything against a Postgres service container on every push/PR to `main`.
 
 ## Structure
 
