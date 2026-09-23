@@ -204,10 +204,11 @@ func (s *Service) CreateJob(lines int) (Job, error) {
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if !s.accepting {
+		s.mu.Unlock()
 		return Job{}, ErrShuttingDown
 	}
+	s.mu.Unlock()
 
 	for {
 		id, err := newID()
@@ -232,6 +233,8 @@ func (s *Service) CreateJob(lines int) (Job, error) {
 		if !created {
 			continue
 		}
+		// StopAccepting may run after the accepting check and before this insert.
+		// Such a job remains queued for another process to claim at the next start.
 		s.signalWorker()
 		s.logger.Info("job created",
 			slog.String("job_id", job.ID),
