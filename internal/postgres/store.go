@@ -3,7 +3,6 @@ package postgres
 
 import (
 	"context"
-	_ "embed"
 	"errors"
 	"fmt"
 	"time"
@@ -13,9 +12,6 @@ import (
 	"github.com/juanjosechiroque/async-job-queue/internal/jobs"
 )
 
-//go:embed schema.sql
-var schema string
-
 const operationTimeout = 5 * time.Second
 
 // Store persists job metadata in Postgres. PDFs themselves remain local files.
@@ -23,7 +19,7 @@ type Store struct {
 	pool *pgxpool.Pool
 }
 
-// New opens the pool, verifies connectivity, and applies the embedded schema.
+// New opens the pool, verifies connectivity, and applies pending migrations.
 func New(ctx context.Context, databaseURL string) (*Store, error) {
 	ctx, cancel := context.WithTimeout(ctx, operationTimeout)
 	defer cancel()
@@ -36,7 +32,7 @@ func New(ctx context.Context, databaseURL string) (*Store, error) {
 		pool.Close()
 		return nil, err
 	}
-	if _, err := pool.Exec(ctx, schema); err != nil {
+	if err := migrate(ctx, pool); err != nil {
 		pool.Close()
 		return nil, err
 	}
