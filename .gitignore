@@ -1,0 +1,11 @@
+# Generated PDF files
+storage/
+
+# Operating system metadata
+.DS_Store
+
+# Local Go build and coverage artifacts
+bin/
+*.test
+coverage.out
+coverage.html
