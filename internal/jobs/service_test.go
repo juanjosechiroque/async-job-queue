@@ -13,9 +13,17 @@ import (
 type testPDFGenerator struct {
 	document []byte
 	err      error
+	started  chan<- struct{}
+	release  <-chan struct{}
 }
 
 func (g testPDFGenerator) Generate(int) ([]byte, error) {
+	if g.started != nil {
+		g.started <- struct{}{}
+	}
+	if g.release != nil {
+		<-g.release
+	}
 	return g.document, g.err
 }
 
