@@ -3,8 +3,9 @@ package main
 import (
 	"context"
 	"errors"
-	"log"
+	"log/slog"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"syscall"
@@ -18,7 +19,8 @@ import (
 func main() {
 	const storageDir = "storage"
 	if err := os.MkdirAll(storageDir, 0o755); err != nil {
-		log.Fatalf("create storage directory: %v", err)
+		slog.Error("create storage directory", slog.Any("error", err))
+		os.Exit(1)
 	}
 
 	textGenerator := text.NewGenerator()
@@ -31,9 +33,13 @@ func main() {
 	mux.Handle("/jobs/", jobHandler)
 
 	server := &http.Server{Addr: ":8080", Handler: mux}
-	serverErrors := make(chan error, 1)
+	pprofServer := &http.Server{Addr: "127.0.0.1:6060", Handler: http.DefaultServeMux}
+	serverErrors := make(chan error, 2)
 	go func() {
 		serverErrors <- server.ListenAndServe()
+	}()
+	go func() {
+		serverErrors <- pprofServer.ListenAndServe()
 	}()
 
 	signals := make(chan os.Signal, 1)
@@ -43,18 +49,22 @@ func main() {
 	select {
 	case err := <-serverErrors:
 		if !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("HTTP server failed: %v", err)
+			slog.Error("HTTP server failed", slog.Any("error", err))
+			os.Exit(1)
 		}
 	case received := <-signals:
-		log.Printf("received %s; beginning graceful shutdown", received)
+		slog.Info("received signal; beginning graceful shutdown", slog.String("signal", received.String()))
 		jobService.StopAccepting()
 		shutdown, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		if err := server.Shutdown(shutdown); err != nil {
-			log.Printf("HTTP shutdown error: %v", err)
+			slog.Error("HTTP shutdown error", slog.Any("error", err))
+		}
+		if err := pprofServer.Shutdown(shutdown); err != nil {
+			slog.Error("pprof shutdown error", slog.Any("error", err))
 		}
 		if err := jobService.Wait(shutdown); err != nil {
-			log.Printf("background job shutdown timeout: %v", err)
+			slog.Error("background job shutdown timeout", slog.Any("error", err))
 		}
 	}
 }

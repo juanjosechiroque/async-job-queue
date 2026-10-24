@@ -96,4 +96,6 @@ There is intentionally no application-level concurrency limit: each accepted req
 
 Both the job store and PDFs are retained until manual cleanup. Job state is lost after process restart, while existing storage files remain on disk but cannot be retrieved because no in-memory job metadata exists.
 
-Operational metrics, workload logs, disk-usage monitoring, and pprof exposure are not implemented yet.
+Job lifecycle events are logged with `log/slog`; every job-specific record has a structured `job_id`, and creation records include the requested line count. Processing, completed, and failed transitions include the generation duration on terminal transitions; completed records also include the PDF size. Generation, storage, and recovered-panic failures log their underlying details internally while the HTTP API continues to return the safe `job failed` message.
+
+Go pprof is served by a separate `http.Server` at `127.0.0.1:6060` using `http.DefaultServeMux`. It is never registered on the public API mux or bound to a public interface, and it is shut down with the public server during graceful shutdown. Operational metrics and disk-usage monitoring are not implemented.

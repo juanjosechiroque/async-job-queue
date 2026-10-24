@@ -25,7 +25,7 @@ From the project root:
 go run ./cmd/server
 ```
 
-The server listens on `http://localhost:8080` and creates `./storage` on startup. Press `Ctrl+C` to stop it. Shutdown stops new work, waits up to 30 seconds for active jobs, and then exits.
+The public API server listens on `http://localhost:8080`; Go pprof is served separately and only on `http://127.0.0.1:6060/debug/pprof/`. The server creates `./storage` on startup. Press `Ctrl+C` to stop it. Shutdown stops new work, shuts down both HTTP servers, waits up to 30 seconds for active jobs, and then exits.
 
 ## API
 
