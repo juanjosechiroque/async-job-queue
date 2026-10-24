@@ -1,7 +1,10 @@
-.PHONY: fmt vet test build check
+.PHONY: fmt fmt-check vet test build check
 
 fmt:
 	gofmt -l -w .
+
+fmt-check:
+	test -z "$$(gofmt -l .)"
 
 vet:
 	go vet ./...

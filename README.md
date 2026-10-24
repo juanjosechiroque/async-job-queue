@@ -1,5 +1,7 @@
 # Async Job Queue
 
+[![CI](https://github.com/juanjosechiroque/async-job-queue/actions/workflows/ci.yml/badge.svg)](https://github.com/juanjosechiroque/async-job-queue/actions/workflows/ci.yml)
+
 Go HTTP service that generates PDF files asynchronously. A request creates a job and returns immediately; the PDF can then be retrieved when its job has completed.
 
 ## Current status
@@ -137,6 +139,8 @@ make check
 ```
 
 This formats the code, runs `go vet`, and runs the tests with the race detector.
+
+CI runs the corresponding format check, vet, race-enabled tests with coverage, and build on every push to `main` and pull request targeting `main`.
 
 ## Current structure
 
