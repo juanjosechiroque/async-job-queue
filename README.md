@@ -16,7 +16,7 @@ go run ./cmd/server
 
 - API: `http://localhost:8080`
 - pprof (debug only, not public): `http://127.0.0.1:6060/debug/pprof/`
-- `Ctrl+C` for graceful shutdown — drains the queue, 30s timeout.
+- `Ctrl+C` for graceful shutdown — drains the queue, 10s timeout.
 
 Requires Go 1.27+ (`go.mod`). No env vars, no external services.
 

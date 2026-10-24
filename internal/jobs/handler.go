@@ -54,7 +54,11 @@ func (h *Handler) createJob(w http.ResponseWriter, r *http.Request) {
 	var request GenerateRequest
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&request); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
+	if err := decoder.Decode(&request); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "request body must be valid JSON")
+		return
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
 		writeJSONError(w, http.StatusBadRequest, "request body must be valid JSON")
 		return
 	}
