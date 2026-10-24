@@ -15,9 +15,12 @@ import (
 
 const MaxLines = 250000
 
+const jobQueueCapacity = 100
+
 var (
 	ErrInvalidLineCount = errors.New("lines must be between 1 and 250000")
 	ErrJobNotFound      = errors.New("job not found")
+	ErrQueueFull        = errors.New("job queue is full")
 	ErrShuttingDown     = errors.New("service is shutting down")
 )
 
@@ -43,6 +46,12 @@ func (s *Store) Create(job Job) bool {
 	}
 	s.jobs[job.ID] = job
 	return true
+}
+
+func (s *Store) Delete(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.jobs, id)
 }
 
 func (s *Store) Get(id string) (Job, bool) {
@@ -92,17 +101,32 @@ type Service struct {
 
 	mu        sync.Mutex
 	accepting bool
+	queue     chan jobRequest
 	jobs      sync.WaitGroup
 }
 
-func NewService(pdfGenerator PDFGenerator, storageDir string) *Service {
-	return &Service{
+type jobRequest struct {
+	id    string
+	lines int
+}
+
+func NewService(pdfGenerator PDFGenerator, storageDir string, workers int) *Service {
+	if workers < 1 {
+		panic("workers must be at least 1")
+	}
+
+	service := &Service{
 		pdfGenerator: pdfGenerator,
 		store:        NewStore(),
 		storageDir:   storageDir,
 		logger:       slog.Default(),
 		accepting:    true,
+		queue:        make(chan jobRequest, jobQueueCapacity),
 	}
+	for range workers {
+		go service.worker()
+	}
+	return service
 }
 
 func (s *Service) CreateJob(lines int) (Job, error) {
@@ -132,13 +156,19 @@ func (s *Service) CreateJob(lines int) (Job, error) {
 		if !s.store.Create(job) {
 			continue
 		}
-		s.logger.Info("job created",
-			slog.String("job_id", job.ID),
-			slog.Int("lines", job.Lines),
-		)
 		s.jobs.Add(1)
-		go s.run(job.ID, lines)
-		return job, nil
+		select {
+		case s.queue <- jobRequest{id: job.ID, lines: lines}:
+			s.logger.Info("job created",
+				slog.String("job_id", job.ID),
+				slog.Int("lines", job.Lines),
+			)
+			return job, nil
+		default:
+			s.jobs.Done()
+			s.store.Delete(job.ID)
+			return Job{}, ErrQueueFull
+		}
 	}
 }
 
@@ -152,8 +182,12 @@ func (s *Service) GetJob(id string) (Job, error) {
 
 func (s *Service) StopAccepting() {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.accepting {
+		return
+	}
 	s.accepting = false
-	s.mu.Unlock()
+	close(s.queue)
 }
 
 func (s *Service) Wait(ctx context.Context) error {
@@ -228,6 +262,12 @@ func (s *Service) run(id string, lines int) {
 		slog.Duration("generation_duration", time.Since(processingStarted)),
 		slog.Int("pdf_size_bytes", len(document)),
 	)
+}
+
+func (s *Service) worker() {
+	for job := range s.queue {
+		s.run(job.id, job.lines)
+	}
 }
 
 func (s *Service) markFailed(id string, processingStarted time.Time) {

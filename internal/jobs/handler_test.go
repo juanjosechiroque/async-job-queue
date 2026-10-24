@@ -21,7 +21,7 @@ func (s erroringJobService) CreateJob(int) (Job, error) { return Job{}, s.err }
 func (s erroringJobService) GetJob(string) (Job, error) { return Job{}, s.err }
 
 func TestHandlerCreateJob(t *testing.T) {
-	service := NewService(testPDFGenerator{document: []byte("%PDF-test")}, t.TempDir())
+	service := NewService(testPDFGenerator{document: []byte("%PDF-test")}, t.TempDir(), 1)
 	handler := NewHandler(service)
 
 	recorder := serveRequest(handler, http.MethodPost, "/jobs", `{"lines":1}`)
@@ -73,7 +73,7 @@ func TestHandlerCreateJobRejectsInvalidRequests(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			handler := NewHandler(NewService(testPDFGenerator{}, t.TempDir()))
+			handler := NewHandler(NewService(testPDFGenerator{}, t.TempDir(), 1))
 			recorder := serveRequest(handler, http.MethodPost, "/jobs", test.body)
 			if recorder.Code != http.StatusBadRequest {
 				t.Fatalf("POST /jobs status = %d, want %d", recorder.Code, http.StatusBadRequest)
@@ -83,8 +83,17 @@ func TestHandlerCreateJobRejectsInvalidRequests(t *testing.T) {
 	}
 }
 
+func TestHandlerCreateJobRejectsFullQueue(t *testing.T) {
+	handler := NewHandler(erroringJobService{err: ErrQueueFull})
+	recorder := serveRequest(handler, http.MethodPost, "/jobs", `{"lines":1}`)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("POST /jobs status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
+	}
+	assertJSONError(t, recorder, "job queue is full")
+}
+
 func TestHandlerRejectsWrongMethodOnJobs(t *testing.T) {
-	handler := NewHandler(NewService(testPDFGenerator{}, t.TempDir()))
+	handler := NewHandler(NewService(testPDFGenerator{}, t.TempDir(), 1))
 	recorder := serveRequest(handler, http.MethodGet, "/jobs", "")
 
 	if recorder.Code != http.StatusMethodNotAllowed {
@@ -94,7 +103,7 @@ func TestHandlerRejectsWrongMethodOnJobs(t *testing.T) {
 }
 
 func TestHandlerRejectsWrongMethodOnJobRoutes(t *testing.T) {
-	handler := NewHandler(NewService(testPDFGenerator{}, t.TempDir()))
+	handler := NewHandler(NewService(testPDFGenerator{}, t.TempDir(), 1))
 
 	tests := []struct {
 		name string
@@ -117,7 +126,7 @@ func TestHandlerRejectsWrongMethodOnJobRoutes(t *testing.T) {
 
 func TestHandlerReadJob(t *testing.T) {
 	t.Run("unknown job", func(t *testing.T) {
-		handler := NewHandler(NewService(testPDFGenerator{}, t.TempDir()))
+		handler := NewHandler(NewService(testPDFGenerator{}, t.TempDir(), 1))
 		recorder := serveRequest(handler, http.MethodGet, "/jobs/abcdefghij", "")
 
 		if recorder.Code != http.StatusNotFound {
@@ -127,7 +136,7 @@ func TestHandlerReadJob(t *testing.T) {
 	})
 
 	t.Run("completed job", func(t *testing.T) {
-		service := NewService(testPDFGenerator{document: []byte("%PDF-test")}, t.TempDir())
+		service := NewService(testPDFGenerator{document: []byte("%PDF-test")}, t.TempDir(), 1)
 		handler := NewHandler(service)
 		created := createJob(t, handler)
 		waitForJobs(t, service)
@@ -156,7 +165,7 @@ func TestHandlerReadJob(t *testing.T) {
 	})
 
 	t.Run("failed job", func(t *testing.T) {
-		service := NewService(testPDFGenerator{err: errors.New("generator failed")}, t.TempDir())
+		service := NewService(testPDFGenerator{err: errors.New("generator failed")}, t.TempDir(), 1)
 		handler := NewHandler(service)
 		created := createJob(t, handler)
 		waitForJobs(t, service)
@@ -177,7 +186,7 @@ func TestHandlerReadJob(t *testing.T) {
 
 func TestHandlerDownloadFile(t *testing.T) {
 	t.Run("queued job", func(t *testing.T) {
-		service := NewService(testPDFGenerator{}, t.TempDir())
+		service := NewService(testPDFGenerator{}, t.TempDir(), 1)
 		const id = "QueuedID01"
 		if created := service.store.Create(Job{ID: id, Status: StatusQueued}); !created {
 			t.Fatal("could not create queued job")
@@ -197,7 +206,7 @@ func TestHandlerDownloadFile(t *testing.T) {
 			document: []byte("%PDF-test"),
 			started:  started,
 			release:  release,
-		}, t.TempDir())
+		}, t.TempDir(), 1)
 		handler := NewHandler(service)
 		created := createJob(t, handler)
 		t.Cleanup(func() {
@@ -219,7 +228,7 @@ func TestHandlerDownloadFile(t *testing.T) {
 	})
 
 	t.Run("completed job", func(t *testing.T) {
-		service := NewService(testPDFGenerator{document: []byte("%PDF-test")}, t.TempDir())
+		service := NewService(testPDFGenerator{document: []byte("%PDF-test")}, t.TempDir(), 1)
 		handler := NewHandler(service)
 		created := createJob(t, handler)
 		waitForJobs(t, service)
@@ -240,7 +249,7 @@ func TestHandlerDownloadFile(t *testing.T) {
 	})
 
 	t.Run("completed job with missing file on disk", func(t *testing.T) {
-		service := NewService(testPDFGenerator{document: []byte("%PDF-test")}, t.TempDir())
+		service := NewService(testPDFGenerator{document: []byte("%PDF-test")}, t.TempDir(), 1)
 		handler := NewHandler(service)
 		created := createJob(t, handler)
 		waitForJobs(t, service)
@@ -271,7 +280,7 @@ func TestHandlerDownloadFile(t *testing.T) {
 	})
 
 	t.Run("failed job", func(t *testing.T) {
-		service := NewService(testPDFGenerator{err: errors.New("generator failed")}, t.TempDir())
+		service := NewService(testPDFGenerator{err: errors.New("generator failed")}, t.TempDir(), 1)
 		handler := NewHandler(service)
 		created := createJob(t, handler)
 		waitForJobs(t, service)
@@ -284,7 +293,7 @@ func TestHandlerDownloadFile(t *testing.T) {
 	})
 
 	t.Run("unknown job", func(t *testing.T) {
-		handler := NewHandler(NewService(testPDFGenerator{}, t.TempDir()))
+		handler := NewHandler(NewService(testPDFGenerator{}, t.TempDir(), 1))
 		recorder := serveRequest(handler, http.MethodGet, "/jobs/abcdefghij/file", "")
 
 		if recorder.Code != http.StatusNotFound {
@@ -295,7 +304,7 @@ func TestHandlerDownloadFile(t *testing.T) {
 }
 
 func TestHandlerRejectsMalformedAndUnknownRoutes(t *testing.T) {
-	handler := NewHandler(NewService(testPDFGenerator{}, t.TempDir()))
+	handler := NewHandler(NewService(testPDFGenerator{}, t.TempDir(), 1))
 
 	for _, path := range []string{
 		"/jobs/short",
