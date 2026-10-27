@@ -18,7 +18,7 @@ Client
 
 ## Startup / shutdown
 
-`cmd/server/main.go` wires dependencies and runs two servers: `:8080` (API) and `127.0.0.1:6060` (pprof, never public). `DATABASE_URL` is required; startup fails fast if it is missing or the Postgres connection/schema setup fails.
+`cmd/server/main.go` wires dependencies and runs two servers: `:8080` (API) and `127.0.0.1:6060` (pprof, never public). `DATABASE_URL` is required; startup fails fast if it is missing or the Postgres connection/migrations fail. `postgres.New` applies embedded, numbered SQL migrations in version order at startup. A session advisory lock serializes concurrent starts; each pending migration and its `schema_migrations` record commit in one transaction. Repeated starts leave applied versions unchanged. The initial migration accepts an existing development `jobs` table.
 
 On `SIGINT`/`SIGTERM`:
 1. Stop accepting new jobs.
@@ -47,7 +47,7 @@ type Job struct {
 }
 ```
 
-`jobs.JobStore` abstracts metadata storage with context-aware operations and explicit errors: `postgres.Store` (pgxpool) in the server, `jobs.Store` (in-memory) for fast unit tests. A missing row is `ErrJobNotFound`; database errors remain errors and are not treated as missing jobs. The embedded schema creates the `jobs` table and a `(status, created_at)` index matching the claim query. PDF bytes never live in the record.
+`jobs.JobStore` abstracts metadata storage with context-aware operations and explicit errors: `postgres.Store` (pgxpool) in the server, `jobs.Store` (in-memory) for fast unit tests. A missing row is `ErrJobNotFound`; database errors remain errors and are not treated as missing jobs. The initial embedded migration creates the `jobs` table and a `(status, created_at)` index matching the claim query. PDF bytes never live in the record.
 
 ID: 10-char Base62, `crypto/rand`, collision-checked on insert.
 
