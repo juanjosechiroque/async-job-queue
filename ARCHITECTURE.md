@@ -1,6 +1,6 @@
 # Architecture
 
-Describes implemented behavior only, not a plan. Job metadata is in Postgres; PDFs are local files.
+Describes implemented behavior only, not a plan. Job metadata lives in Postgres; PDFs are local files.
 
 ## Overview
 
@@ -18,21 +18,21 @@ Client
 
 ## Startup / shutdown
 
-`cmd/server/main.go` wires dependencies and runs two servers: `:8080` (API) and `127.0.0.1:6060` (pprof, never public).
+`cmd/server/main.go` wires dependencies and runs two servers: `:8080` (API) and `127.0.0.1:6060` (pprof, never public). `DATABASE_URL` is required; startup fails fast if it is missing or the Postgres connection/schema setup fails.
 
 On `SIGINT`/`SIGTERM`:
 1. Stop accepting new jobs.
 2. Shut down both HTTP servers.
-3. Workers keep claiming queued jobs and drain locally-created work, then exit.
-4. Wait up to 10s for jobs to finish, then exit.
+3. Workers stop claiming work; jobs already executing in this process finish, while queued rows remain in the store for a later process to claim.
+4. Wait up to 10s, then exit.
 
-A full 100-job queue at the largest allowed size (250,000 lines) drains in ~2.8s measured (4 workers, ~103ms generation + ~9ms disk write per job) — 10s leaves ~3.5x margin for production I/O the local benchmark doesn't capture.
+Why 10s: shutdown waits only for jobs already in progress. At most 4 run at once, in parallel, so the wait is about one job: ~112ms for the largest (~103ms generation + ~9ms disk write), excluding Postgres round-trips. A local shutdown with jobs in flight exited in under 1s; 10s leaves ample margin for slower production I/O.
 
-Workers don't use the originating request context — a job keeps running after its `202` is sent.
+Workers don't use the request context — a job keeps running after its `202` is sent.
 
 ## Rate limiting
 
-`internal/ratelimit` gates `POST /jobs` only, per source IP, in-memory. It uses independent `golang.org/x/time/rate` token buckets: 10/minute with a burst of 10, and 100/hour with a burst of 100 — unvalidated starting values chosen to bound abuse, not modeled from real traffic. Over either limit: `429`, with a `Retry-After` header in seconds. Uses the raw socket address, not `X-Forwarded-For`: trusting that header without a configured reverse-proxy hop count would let any client spoof a different IP and bypass its own limit. Resets on restart; not shared across replicas — exists to stop one client from filling the queue, not as a distributed rate limit.
+`internal/ratelimit` gates `POST /jobs` per source IP, in memory, with two `golang.org/x/time/rate` token buckets: 10/minute (burst 10) and 100/hour (burst 100). Over either limit: `429` with a `Retry-After` header in seconds. It uses the socket address, not `X-Forwarded-For` (see Decisions).
 
 ## Job model
 
@@ -45,35 +45,27 @@ type Job struct {
 }
 ```
 
-`internal/jobs.JobStore` abstracts metadata operations. `internal/postgres.Store` is used by the server through `pgxpool`; `internal/jobs.Store` remains an in-memory implementation used by fast unit tests. The embedded SQL schema creates the `jobs` table and `(status, created_at)` claim index. PDF bytes never live in the record.
+`jobs.JobStore` abstracts metadata storage: `postgres.Store` (pgxpool) in the server, `jobs.Store` (in-memory) for fast unit tests. The embedded schema creates the `jobs` table and a `(status, created_at)` index matching the claim query. PDF bytes never live in the record.
 
 ID: 10-char Base62, `crypto/rand`, collision-checked on insert.
 
-Write path: generate -> temp file -> atomic rename -> mark `completed`. No partial PDF is ever servable. Panics in a worker are recovered and the job is marked `failed`; internal error detail is logged, never returned to the client.
+Write path: generate -> temp file -> atomic rename -> mark `completed`. A partial PDF is never servable. Worker panics are recovered and the job is marked `failed`; error detail is logged, never returned to the client.
 
 ## Concurrency
 
-4 long-lived workers poll Postgres while idle (every 200ms) and atomically claim a queued row using `SELECT ... FOR UPDATE SKIP LOCKED`, changing it to `processing` in the same transaction. At most 4 PDF generations run at once per service process. `SKIP LOCKED` makes the claim safe across concurrent workers and multiple service processes using the same database: a row locked by one claimant is unavailable to the others.
+4 workers per process poll Postgres (every 200ms while idle; woken immediately by jobs created in the same process) and claim a row with `SELECT ... FOR UPDATE SKIP LOCKED`, setting it to `processing` in the same transaction. At most 4 generations run at once per process. A row locked by one claimant is skipped by the others — across workers and across processes.
 
-`CreateJob` inserts through a transaction that serializes the queued-row count and insert. A count at or above 100 returns `ErrQueueFull` (`503`) immediately and does not persist the job, rather than leaving the request hanging until space frees up.
-
-`jobQueueCapacity = 100` is an unvalidated starting value: generation is fast enough (~100ms worst case, 4 workers) that 100 queued jobs drain in under 3 seconds, too quick to have ever pressure-tested the number. A slower, I/O-bound generator (real rendering, disk, or network calls) would need to remeasure it.
-
-The persisted queue can be consumed by multiple instances safely. This local setup starts one instance only. The rate limiter remains in-memory and is not shared across replicas.
-
-## Persistence and retention
-
-`DATABASE_URL` is read once at startup. Startup fails fast if it is absent or if the initial Postgres connection/schema application fails. `docker compose up -d --wait` starts the local Postgres service with a named data volume; its job records survive server and Compose restarts.
-
-Completed PDFs are still local files in `storage/`. There is intentionally no file or database-record retention process. This manual file-retention concern is more important now that job records persist; implementing cleanup is explicitly out of scope.
+`CreateJob` counts queued rows and inserts in one transaction under an advisory lock. At 100 queued it returns `ErrQueueFull` (`503`) and persists nothing.
 
 ## Observability
 
 - `log/slog`; every job log line carries `job_id`, plus line count, state transitions, generation duration, PDF size.
 - `pprof` on `127.0.0.1:6060`, isolated from the public API.
-- No metrics or alerting yet.
+- No metrics or alerting.
 
 ## Measured impact: worker pool vs. unbounded
+
+Measured on the earlier in-memory version, before Postgres and the rate limiter; the cap of 4 concurrent generators is unchanged. From a single IP, the `hey` command below would now hit the rate limiter.
 
 Load: `hey -c 100 -n 100 -m POST -d '{"lines":250000}' localhost:8080/jobs`, `pprof` sampled immediately after.
 
@@ -82,4 +74,24 @@ Load: `hey -c 100 -n 100 -m POST -d '{"lines":250000}' localhost:8080/jobs`, `pp
 | Before (unbounded) | 93 | 703 MB |
 | After (4 workers) | 10 | 85 MB |
 
-98% of baseline heap traced to `bytes.growSlice` in `pdf.Generator.Generate` — each concurrent job builds its full PDF in memory before writing. Four workers were chosen to cap simultaneous generators while still keeping the 100-request benchmark admissible through the 100-entry queue; the pool cut goroutines 89% and heap 88% at this load.
+98% of baseline heap traced to `bytes.growSlice` in `pdf.Generator.Generate` — each concurrent job builds its full PDF in memory before writing. The pool cut goroutines 89% and heap 88%.
+
+## Decisions and trade-offs
+
+| Decision | Why | Cost |
+|---|---|---|
+| Poll Postgres every 200ms, not `LISTEN/NOTIFY` | Simplest correct claim loop; also finds jobs created by other instances | Up to 200ms pickup latency; idle load of 4 workers × 5 polls/s |
+| 4 workers | Caps peak memory (93 → 10 goroutines, 703 → 85 MB above) | At most 4 concurrent generations per process |
+| `503` when the queue is full, instead of blocking | A blocked request has no bound of its own and gives the client no retry signal | Clients must retry |
+| Advisory lock on job creation | Count + insert cannot race past the 100 cap, even across processes | All job creation serializes on one lock |
+| Socket IP, not `X-Forwarded-For` | The header is spoofable without a trusted-proxy hop count | Behind a proxy, every client looks like one IP |
+| PDFs on local disk, metadata in Postgres | Keeps large blobs out of the database | Files are not shared across instances (below) |
+
+## Known limitations
+
+- **Downloads are per-instance.** Claiming is safe across instances, but each instance writes PDFs to its own `storage/`, so `GET /jobs/{id}/file` returns `500` on any instance that didn't generate the file. Multi-instance needs shared storage.
+- **No recovery of `processing` jobs.** If a process dies, or the shutdown deadline expires, mid-job, the row stays `processing` — there is no lease or requeue.
+- **No retention.** PDFs and job records grow without bound; cleanup is out of scope.
+- **Unvalidated numbers.** The queue cap (100) and rate limits (10/min, 100/hour) are starting values. Generation takes ~100ms at worst, too fast to pressure-test them; a slower workload needs re-measuring.
+- **The rate limiter is per-process** and resets on restart.
+- **No metrics or alerting**, only logs and `pprof`.
