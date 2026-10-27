@@ -19,6 +19,10 @@ type testPDFGenerator struct {
 	release  <-chan struct{}
 }
 
+func newTestService(generator PDFGenerator, storageDir string, workers int) *Service {
+	return NewService(generator, storageDir, workers, NewStore())
+}
+
 func (g testPDFGenerator) Generate(int) ([]byte, error) {
 	if g.started != nil {
 		g.started <- struct{}{}
@@ -31,9 +35,9 @@ func (g testPDFGenerator) Generate(int) ([]byte, error) {
 
 func TestServiceCompletesJobAndStoresPDF(t *testing.T) {
 	storageDir := t.TempDir()
-	service := NewService(testPDFGenerator{document: []byte("%PDF-test")}, storageDir, 1)
+	service := newTestService(testPDFGenerator{document: []byte("%PDF-test")}, storageDir, 1)
 
-	created, err := service.CreateJob(MaxLines)
+	created, err := service.CreateJob(context.Background(), MaxLines)
 	if err != nil {
 		t.Fatalf("CreateJob() error = %v", err)
 	}
@@ -46,7 +50,7 @@ func TestServiceCompletesJobAndStoresPDF(t *testing.T) {
 
 	waitForTerminalJob(t, service, created.ID)
 
-	completed, err := service.GetJob(created.ID)
+	completed, err := service.GetJob(context.Background(), created.ID)
 	if err != nil {
 		t.Fatalf("GetJob() error = %v", err)
 	}
@@ -66,15 +70,15 @@ func TestServiceCompletesJobAndStoresPDF(t *testing.T) {
 }
 
 func TestServiceMarksGeneratorFailures(t *testing.T) {
-	service := NewService(testPDFGenerator{err: errors.New("generator failed")}, t.TempDir(), 1)
-	created, err := service.CreateJob(1)
+	service := newTestService(testPDFGenerator{err: errors.New("generator failed")}, t.TempDir(), 1)
+	created, err := service.CreateJob(context.Background(), 1)
 	if err != nil {
 		t.Fatalf("CreateJob() error = %v", err)
 	}
 
 	waitForTerminalJob(t, service, created.ID)
 
-	failed, err := service.GetJob(created.ID)
+	failed, err := service.GetJob(context.Background(), created.ID)
 	if err != nil {
 		t.Fatalf("GetJob() error = %v", err)
 	}
@@ -84,8 +88,8 @@ func TestServiceMarksGeneratorFailures(t *testing.T) {
 }
 
 func TestServiceRejectsLineCountAboveMaximum(t *testing.T) {
-	service := NewService(testPDFGenerator{}, t.TempDir(), 1)
-	if _, err := service.CreateJob(MaxLines + 1); !errors.Is(err, ErrInvalidLineCount) {
+	service := newTestService(testPDFGenerator{}, t.TempDir(), 1)
+	if _, err := service.CreateJob(context.Background(), MaxLines+1); !errors.Is(err, ErrInvalidLineCount) {
 		t.Fatalf("CreateJob() error = %v, want %v", err, ErrInvalidLineCount)
 	}
 }
@@ -93,13 +97,13 @@ func TestServiceRejectsLineCountAboveMaximum(t *testing.T) {
 func TestServiceLimitsConcurrentProcessing(t *testing.T) {
 	started := make(chan struct{}, 2)
 	release := make(chan struct{})
-	service := NewService(testPDFGenerator{
+	service := newTestService(testPDFGenerator{
 		document: []byte("%PDF-test"),
 		started:  started,
 		release:  release,
 	}, t.TempDir(), 1)
 
-	first, err := service.CreateJob(1)
+	first, err := service.CreateJob(context.Background(), 1)
 	if err != nil {
 		t.Fatalf("CreateJob() first job error = %v", err)
 	}
@@ -108,7 +112,7 @@ func TestServiceLimitsConcurrentProcessing(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("first job did not start")
 	}
-	second, err := service.CreateJob(1)
+	second, err := service.CreateJob(context.Background(), 1)
 	if err != nil {
 		t.Fatalf("CreateJob() second job error = %v", err)
 	}
@@ -131,13 +135,13 @@ func TestServiceLimitsConcurrentProcessing(t *testing.T) {
 func TestServiceRejectsJobsWhenQueueIsFull(t *testing.T) {
 	started := make(chan struct{}, jobQueueCapacity+1)
 	release := make(chan struct{})
-	service := NewService(testPDFGenerator{
+	service := newTestService(testPDFGenerator{
 		document: []byte("%PDF-test"),
 		started:  started,
 		release:  release,
 	}, t.TempDir(), 1)
 
-	blocking, err := service.CreateJob(1)
+	blocking, err := service.CreateJob(context.Background(), 1)
 	if err != nil {
 		t.Fatalf("CreateJob() blocking job error = %v", err)
 	}
@@ -148,13 +152,13 @@ func TestServiceRejectsJobsWhenQueueIsFull(t *testing.T) {
 	}
 	queued := make([]Job, 0, jobQueueCapacity)
 	for range jobQueueCapacity {
-		job, err := service.CreateJob(1)
+		job, err := service.CreateJob(context.Background(), 1)
 		if err != nil {
 			t.Fatalf("CreateJob() queued job error = %v", err)
 		}
 		queued = append(queued, job)
 	}
-	if _, err := service.CreateJob(1); !errors.Is(err, ErrQueueFull) {
+	if _, err := service.CreateJob(context.Background(), 1); !errors.Is(err, ErrQueueFull) {
 		t.Fatalf("CreateJob() error = %v, want %v", err, ErrQueueFull)
 	}
 
@@ -168,7 +172,7 @@ func TestServiceRejectsJobsWhenQueueIsFull(t *testing.T) {
 func TestServiceConcurrentCreateJobsRespectsQueueCapacity(t *testing.T) {
 	started := make(chan struct{}, 1)
 	release := make(chan struct{})
-	service := NewService(testPDFGenerator{
+	service := newTestService(testPDFGenerator{
 		document: []byte("%PDF-test"),
 		started:  started,
 		release:  release,
@@ -183,7 +187,7 @@ func TestServiceConcurrentCreateJobsRespectsQueueCapacity(t *testing.T) {
 		}
 	}()
 
-	if _, err := service.CreateJob(1); err != nil {
+	if _, err := service.CreateJob(context.Background(), 1); err != nil {
 		t.Fatalf("CreateJob() blocking job error = %v", err)
 	}
 	select {
@@ -203,7 +207,7 @@ func TestServiceConcurrentCreateJobsRespectsQueueCapacity(t *testing.T) {
 		go func() {
 			defer creators.Done()
 			<-start
-			_, err := service.CreateJob(1)
+			_, err := service.CreateJob(context.Background(), 1)
 			switch {
 			case err == nil:
 				accepted.Add(1)
@@ -228,7 +232,7 @@ func TestServiceConcurrentCreateJobsRespectsQueueCapacity(t *testing.T) {
 }
 
 func TestServiceCreateConcurrentWithStopAccepting(t *testing.T) {
-	service := NewService(testPDFGenerator{document: []byte("%PDF-test")}, t.TempDir(), 2)
+	service := newTestService(testPDFGenerator{document: []byte("%PDF-test")}, t.TempDir(), 2)
 	const callers = 64
 	start := make(chan struct{})
 	var creators sync.WaitGroup
@@ -238,7 +242,7 @@ func TestServiceCreateConcurrentWithStopAccepting(t *testing.T) {
 		go func() {
 			defer creators.Done()
 			<-start
-			_, err := service.CreateJob(1)
+			_, err := service.CreateJob(context.Background(), 1)
 			if err != nil && !errors.Is(err, ErrShuttingDown) && !errors.Is(err, ErrQueueFull) {
 				unexpected.Add(1)
 			}
@@ -260,13 +264,13 @@ func TestServiceCreateConcurrentWithStopAccepting(t *testing.T) {
 func TestServiceLeavesQueuedJobsAfterStopAccepting(t *testing.T) {
 	started := make(chan struct{}, 1)
 	release := make(chan struct{})
-	service := NewService(testPDFGenerator{
+	service := newTestService(testPDFGenerator{
 		document: []byte("%PDF-test"),
 		started:  started,
 		release:  release,
 	}, t.TempDir(), 1)
 
-	first, err := service.CreateJob(1)
+	first, err := service.CreateJob(context.Background(), 1)
 	if err != nil {
 		t.Fatalf("CreateJob() first job error = %v", err)
 	}
@@ -275,12 +279,12 @@ func TestServiceLeavesQueuedJobsAfterStopAccepting(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("first job did not start")
 	}
-	second, err := service.CreateJob(1)
+	second, err := service.CreateJob(context.Background(), 1)
 	if err != nil {
 		t.Fatalf("CreateJob() second job error = %v", err)
 	}
 	service.StopAccepting()
-	if _, err := service.CreateJob(1); !errors.Is(err, ErrShuttingDown) {
+	if _, err := service.CreateJob(context.Background(), 1); !errors.Is(err, ErrShuttingDown) {
 		t.Fatalf("CreateJob() after StopAccepting() error = %v, want %v", err, ErrShuttingDown)
 	}
 
@@ -290,14 +294,14 @@ func TestServiceLeavesQueuedJobsAfterStopAccepting(t *testing.T) {
 	if err := service.Wait(ctx); err != nil {
 		t.Fatalf("Wait() error = %v", err)
 	}
-	firstJob, err := service.GetJob(first.ID)
+	firstJob, err := service.GetJob(context.Background(), first.ID)
 	if err != nil {
 		t.Fatalf("GetJob(%q) error = %v", first.ID, err)
 	}
 	if firstJob.Status != StatusCompleted {
 		t.Fatalf("GetJob(%q) status = %q, want %q", first.ID, firstJob.Status, StatusCompleted)
 	}
-	secondJob, err := service.GetJob(second.ID)
+	secondJob, err := service.GetJob(context.Background(), second.ID)
 	if err != nil {
 		t.Fatalf("GetJob(%q) error = %v", second.ID, err)
 	}
@@ -310,7 +314,7 @@ func waitForTerminalJob(t *testing.T, service *Service, id string) Job {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
-		job, err := service.GetJob(id)
+		job, err := service.GetJob(context.Background(), id)
 		if err != nil {
 			t.Fatalf("GetJob(%q) error = %v", id, err)
 		}
@@ -330,5 +334,38 @@ func TestNewIDUsesBase62(t *testing.T) {
 	}
 	if len(id) != 10 || !validID(id) || strings.ContainsAny(id, "-_/") {
 		t.Fatalf("newID() = %q, want a 10-character Base62 ID", id)
+	}
+}
+
+func TestMemoryStoreErrorsContextAndClaimOrder(t *testing.T) {
+	store := NewStore()
+	base := time.Now().UTC()
+	for _, job := range []Job{
+		{ID: "later00001", Status: StatusQueued, CreatedAt: base.Add(time.Second)},
+		{ID: "older00002", Status: StatusQueued, CreatedAt: base},
+		{ID: "older00001", Status: StatusQueued, CreatedAt: base},
+	} {
+		if created, err := store.CreateQueued(context.Background(), job, jobQueueCapacity); err != nil || !created {
+			t.Fatalf("CreateQueued(%q) = (%t, %v), want (true, nil)", job.ID, created, err)
+		}
+	}
+
+	for _, wantID := range []string{"older00001", "older00002", "later00001"} {
+		job, claimed, err := store.ClaimQueued(context.Background())
+		if err != nil || !claimed || job.ID != wantID {
+			t.Fatalf("ClaimQueued() = (%q, %t, %v), want (%q, true, nil)", job.ID, claimed, err, wantID)
+		}
+	}
+	if _, err := store.Get(context.Background(), "missing000"); !errors.Is(err, ErrJobNotFound) {
+		t.Errorf("Get(missing) error = %v, want ErrJobNotFound", err)
+	}
+	if err := store.MarkCompleted(context.Background(), "missing000", "missing.pdf"); !errors.Is(err, ErrJobNotFound) {
+		t.Errorf("MarkCompleted(missing) error = %v, want ErrJobNotFound", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := store.Get(ctx, "older00001"); !errors.Is(err, context.Canceled) {
+		t.Errorf("Get(canceled) error = %v, want context.Canceled", err)
 	}
 }
