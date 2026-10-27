@@ -2,7 +2,6 @@ package jobs
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -40,7 +39,7 @@ func TestHandlerCreateJob(t *testing.T) {
 		t.Fatalf("POST /jobs downloadUrl = %q, want %q", response.DownloadURL, want)
 	}
 
-	waitForJobs(t, service)
+	waitForJob(t, service, response.JobID)
 }
 
 func TestHandlerCreateJobRejectsInvalidRequests(t *testing.T) {
@@ -139,7 +138,7 @@ func TestHandlerReadJob(t *testing.T) {
 		service := NewService(testPDFGenerator{document: []byte("%PDF-test")}, t.TempDir(), 1)
 		handler := NewHandler(service)
 		created := createJob(t, handler)
-		waitForJobs(t, service)
+		waitForJob(t, service, created.JobID)
 
 		recorder := serveRequest(handler, http.MethodGet, "/jobs/"+created.JobID, "")
 		if recorder.Code != http.StatusOK {
@@ -168,7 +167,7 @@ func TestHandlerReadJob(t *testing.T) {
 		service := NewService(testPDFGenerator{err: errors.New("generator failed")}, t.TempDir(), 1)
 		handler := NewHandler(service)
 		created := createJob(t, handler)
-		waitForJobs(t, service)
+		waitForJob(t, service, created.JobID)
 
 		recorder := serveRequest(handler, http.MethodGet, "/jobs/"+created.JobID, "")
 		if recorder.Code != http.StatusOK {
@@ -211,7 +210,7 @@ func TestHandlerDownloadFile(t *testing.T) {
 		created := createJob(t, handler)
 		t.Cleanup(func() {
 			close(release)
-			waitForJobs(t, service)
+			waitForJob(t, service, created.JobID)
 		})
 
 		select {
@@ -231,7 +230,7 @@ func TestHandlerDownloadFile(t *testing.T) {
 		service := NewService(testPDFGenerator{document: []byte("%PDF-test")}, t.TempDir(), 1)
 		handler := NewHandler(service)
 		created := createJob(t, handler)
-		waitForJobs(t, service)
+		waitForJob(t, service, created.JobID)
 
 		recorder := serveRequest(handler, http.MethodGet, "/jobs/"+created.JobID+"/file", "")
 		if recorder.Code != http.StatusOK {
@@ -252,7 +251,7 @@ func TestHandlerDownloadFile(t *testing.T) {
 		service := NewService(testPDFGenerator{document: []byte("%PDF-test")}, t.TempDir(), 1)
 		handler := NewHandler(service)
 		created := createJob(t, handler)
-		waitForJobs(t, service)
+		waitForJob(t, service, created.JobID)
 
 		job, err := service.GetJob(created.JobID)
 		if err != nil {
@@ -283,7 +282,7 @@ func TestHandlerDownloadFile(t *testing.T) {
 		service := NewService(testPDFGenerator{err: errors.New("generator failed")}, t.TempDir(), 1)
 		handler := NewHandler(service)
 		created := createJob(t, handler)
-		waitForJobs(t, service)
+		waitForJob(t, service, created.JobID)
 
 		recorder := serveRequest(handler, http.MethodGet, "/jobs/"+created.JobID+"/file", "")
 		if recorder.Code != http.StatusInternalServerError {
@@ -337,13 +336,9 @@ func serveRequest(handler http.Handler, method, target, body string) *httptest.R
 	return recorder
 }
 
-func waitForJobs(t *testing.T, service *Service) {
+func waitForJob(t *testing.T, service *Service, id string) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	if err := service.Wait(ctx); err != nil {
-		t.Fatalf("Wait() error = %v", err)
-	}
+	waitForTerminalJob(t, service, id)
 }
 
 func assertJSONError(t *testing.T, recorder *httptest.ResponseRecorder, want string) {
