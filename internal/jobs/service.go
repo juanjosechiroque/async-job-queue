@@ -158,8 +158,8 @@ type Service struct {
 	mu        sync.Mutex
 	accepting bool
 	stopping  bool
-	tracked   map[string]struct{}
 	wake      chan struct{}
+	stop      chan struct{}
 	jobs      sync.WaitGroup
 }
 
@@ -189,8 +189,8 @@ func newService(pdfGenerator PDFGenerator, storageDir string, workers int, memor
 		storageDir:   storageDir,
 		logger:       slog.Default(),
 		accepting:    true,
-		tracked:      make(map[string]struct{}),
 		wake:         make(chan struct{}, 1),
+		stop:         make(chan struct{}),
 	}
 	for range workers {
 		go service.worker()
@@ -232,8 +232,6 @@ func (s *Service) CreateJob(lines int) (Job, error) {
 		if !created {
 			continue
 		}
-		s.jobs.Add(1)
-		s.tracked[job.ID] = struct{}{}
 		s.signalWorker()
 		s.logger.Info("job created",
 			slog.String("job_id", job.ID),
@@ -259,15 +257,22 @@ func (s *Service) StopAccepting() {
 	}
 	s.accepting = false
 	s.stopping = true
-	s.signalWorker()
+	close(s.stop)
 }
 
+// Wait blocks until the jobs this service's workers are running finish, or ctx
+// ends. Call it after StopAccepting: only then are no further jobs claimed.
 func (s *Service) Wait(ctx context.Context) error {
+	// StopAccepting and worker Add calls share this lock. Once stopping is set,
+	// no worker can add new work after this point, so Wait observes a stable
+	// WaitGroup counter.
+	s.mu.Lock()
 	done := make(chan struct{})
 	go func() {
 		s.jobs.Wait()
 		close(done)
 	}()
+	s.mu.Unlock()
 	select {
 	case <-done:
 		return nil
@@ -276,10 +281,7 @@ func (s *Service) Wait(ctx context.Context) error {
 	}
 }
 
-func (s *Service) run(job Job, tracked bool) {
-	if tracked {
-		defer s.finishTracked(job.ID)
-	}
+func (s *Service) run(job Job) {
 	processingStarted := time.Now()
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -341,25 +343,40 @@ func (s *Service) worker() {
 		tick = ticker.C
 		defer ticker.Stop()
 	} else {
-		// Do not inspect the in-memory map until a service-created job wakes us.
-		// This retains the direct Store setup behavior used by the unit tests.
-		<-s.wake
+		// Keep direct Store setup deterministic for unit tests, while allowing a
+		// shutdown to wake every idle in-memory worker.
+		select {
+		case <-s.wake:
+		case <-s.stop:
+			return
+		}
 	}
 	for {
+		// Holding mu across the stopping check and Add prevents StopAccepting
+		// from racing a new Add with Wait.
+		s.mu.Lock()
+		if s.stopping {
+			s.mu.Unlock()
+			return
+		}
+		s.jobs.Add(1)
+		s.mu.Unlock()
+
 		job, claimed, err := s.jobStore.ClaimQueued(context.Background())
 		if err != nil {
 			s.logger.Error("claim queued job", slog.Any("error", err))
 		} else if claimed {
-			s.run(job, s.isTracked(job.ID))
+			s.run(job)
+			s.jobs.Done()
 			continue
 		}
+		s.jobs.Done()
 
-		if s.shouldStopWorker() {
-			return
-		}
 		select {
 		case <-tick:
 		case <-s.wake:
+		case <-s.stop:
+			return
 		}
 	}
 }
@@ -384,27 +401,6 @@ func (s *Service) signalWorker() {
 	case s.wake <- struct{}{}:
 	default:
 	}
-}
-
-func (s *Service) isTracked(id string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_, ok := s.tracked[id]
-	return ok
-}
-
-func (s *Service) finishTracked(id string) {
-	s.mu.Lock()
-	delete(s.tracked, id)
-	s.mu.Unlock()
-	s.jobs.Done()
-	s.signalWorker()
-}
-
-func (s *Service) shouldStopWorker() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.stopping && len(s.tracked) == 0
 }
 
 func (s *Service) writePDF(id string, document []byte) (string, error) {
