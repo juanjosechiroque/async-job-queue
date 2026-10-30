@@ -18,6 +18,7 @@ import (
 
 func main() {
 	const storageDir = "storage"
+	const workers = 4
 	if err := os.MkdirAll(storageDir, 0o755); err != nil {
 		slog.Error("create storage directory", slog.Any("error", err))
 		os.Exit(1)
@@ -25,7 +26,7 @@ func main() {
 
 	textGenerator := text.NewGenerator()
 	pdfGenerator := pdf.NewGenerator(textGenerator)
-	jobService := jobs.NewService(pdfGenerator, storageDir)
+	jobService := jobs.NewService(pdfGenerator, storageDir, workers)
 	jobHandler := jobs.NewHandler(jobService)
 
 	mux := http.NewServeMux()

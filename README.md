@@ -6,10 +6,10 @@ Go HTTP service that generates PDF files asynchronously. A request creates a job
 
 ## Current status
 
-Each accepted job runs in its own background goroutine. This version intentionally has no worker pool, queue, concurrency limit, database, or automatic file retention.
+Accepted jobs are placed on a bounded in-memory queue and processed by four long-lived workers. The queue holds up to 100 waiting jobs; a full queue is rejected with `503` rather than blocking the HTTP request. This version has no database or automatic file retention.
 
 ```text
-POST /jobs -> validate -> create in-memory job -> generate and store PDF in background
+POST /jobs -> validate -> enqueue -> worker generates and stores PDF
 ```
 
 `POST /job` is no longer available.
@@ -27,7 +27,7 @@ From the project root:
 go run ./cmd/server
 ```
 
-The public API server listens on `http://localhost:8080`; Go pprof is served separately and only on `http://127.0.0.1:6060/debug/pprof/`. The server creates `./storage` on startup. Press `Ctrl+C` to stop it. Shutdown stops new work, shuts down both HTTP servers, waits up to 30 seconds for active jobs, and then exits.
+The public API server listens on `http://localhost:8080`; Go pprof is served separately and only on `http://127.0.0.1:6060/debug/pprof/`. The server creates `./storage` on startup. Press `Ctrl+C` to stop it. Shutdown stops new work, closes the queue, lets workers drain accepted jobs, shuts down both HTTP servers, waits up to 30 seconds for jobs, and then exits.
 
 ## API
 
@@ -104,6 +104,7 @@ Errors use `application/json; charset=utf-8`.
 | `lines` outside the allowed range | `400` | `{"error":"lines must be between 1 and 250000"}` |
 | Unknown job ID | `404` | `{"error":"job not found"}` |
 | Service is shutting down | `503` | `{"error":"service is shutting down"}` |
+| Job queue is full | `503` | `{"error":"job queue is full"}` |
 
 Internal generation and storage details are not returned to clients.
 
@@ -148,7 +149,7 @@ CI runs the corresponding format check, vet, race-enabled tests with coverage, a
 cmd/server/main.go        HTTP server startup, storage initialization, shutdown wiring
 internal/jobs/handler.go  HTTP API handler
 internal/jobs/model.go    Request, job state, and response models
-internal/jobs/service.go  Validation, in-memory store, background job execution, file storage
+internal/jobs/service.go  Validation, bounded job queue, worker execution, in-memory store, file storage
 internal/pdf/            PDF document generation
 internal/text/           Per-line text selection
 ```
