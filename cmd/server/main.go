@@ -11,9 +11,9 @@ import (
 	"syscall"
 	"time"
 
-	"async-job-queue/internal/jobs"
-	"async-job-queue/internal/pdf"
-	"async-job-queue/internal/text"
+	"github.com/juanjosechiroque/async-job-queue/internal/jobs"
+	"github.com/juanjosechiroque/async-job-queue/internal/pdf"
+	"github.com/juanjosechiroque/async-job-queue/internal/text"
 )
 
 func main() {
