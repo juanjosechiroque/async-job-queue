@@ -23,13 +23,15 @@ On `SIGINT`/`SIGTERM`:
 1. Stop accepting new jobs.
 2. Shut down both HTTP servers.
 3. Close the queue — workers drain in-flight jobs, then exit.
-4. Wait up to 30s for jobs to finish, then exit.
+4. Wait up to 10s for jobs to finish, then exit.
+
+A full 100-job queue at the largest allowed size (250,000 lines) drains in ~2.8s measured (4 workers, ~103ms generation + ~9ms disk write per job) — 10s leaves ~3.5x margin for production I/O the local benchmark doesn't capture.
 
 Workers don't use the originating request context — a job keeps running after its `202` is sent.
 
 ## Rate limiting
 
-`internal/ratelimit` gates `POST /jobs` only, per source IP, in-memory. It uses independent `golang.org/x/time/rate` token buckets: 10/minute with a burst of 10, and 100/hour with a burst of 100. Over either limit: `429`, with a `Retry-After` header in seconds. Uses the raw socket address, not `X-Forwarded-For`: trusting that header without a configured reverse-proxy hop count would let any client spoof a different IP and bypass its own limit. Resets on restart; not shared across replicas — exists to stop one client from filling the queue, not as a distributed rate limit.
+`internal/ratelimit` gates `POST /jobs` only, per source IP, in-memory. It uses independent `golang.org/x/time/rate` token buckets: 10/minute with a burst of 10, and 100/hour with a burst of 100 — unvalidated starting values chosen to bound abuse, not modeled from real traffic. Over either limit: `429`, with a `Retry-After` header in seconds. Uses the raw socket address, not `X-Forwarded-For`: trusting that header without a configured reverse-proxy hop count would let any client spoof a different IP and bypass its own limit. Resets on restart; not shared across replicas — exists to stop one client from filling the queue, not as a distributed rate limit.
 
 ## Job model
 
@@ -50,7 +52,11 @@ Write path: generate -> temp file -> atomic rename -> mark `completed`. No parti
 
 ## Concurrency
 
-4 long-lived workers read from a channel buffered for 100 jobs — at most 4 PDF generations run at once. `CreateJob` enqueues non-blocking: full queue returns `ErrQueueFull` (`503`), job not persisted.
+4 long-lived workers read from a channel buffered for 100 jobs — at most 4 PDF generations run at once. This bounds peak memory during a burst, not per-job wait time: even the largest allowed PDF (250,000 lines) generates in ~100ms, so a full queue drains in a few seconds either way — see "Measured impact" for why the memory bound still matters at this speed.
+
+`CreateJob` enqueues non-blocking: a full queue returns `ErrQueueFull` (`503`) immediately, job not persisted, rather than leaving the request hanging until space frees up — an indefinite wait has no bound of its own and gives the client no clear signal to retry.
+
+`jobQueueCapacity = 100` is an unvalidated starting value: generation is fast enough (~100ms worst case, 4 workers) that 100 queued jobs drain in under 3 seconds, too quick to have ever pressure-tested the number. A slower, I/O-bound generator (real rendering, disk, or network calls) would need to remeasure it.
 
 Single-instance only: the queue and rate limiter are both in-memory, nothing coordinates state across replicas.
 
