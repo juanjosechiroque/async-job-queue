@@ -13,6 +13,7 @@ import (
 
 	"github.com/juanjosechiroque/async-job-queue/internal/jobs"
 	"github.com/juanjosechiroque/async-job-queue/internal/pdf"
+	jobpostgres "github.com/juanjosechiroque/async-job-queue/internal/postgres"
 	"github.com/juanjosechiroque/async-job-queue/internal/ratelimit"
 	"github.com/juanjosechiroque/async-job-queue/internal/text"
 )
@@ -24,10 +25,21 @@ func main() {
 		slog.Error("create storage directory", slog.Any("error", err))
 		os.Exit(1)
 	}
+	databaseURL, ok := os.LookupEnv("DATABASE_URL")
+	if !ok || databaseURL == "" {
+		slog.Error("DATABASE_URL must be set")
+		os.Exit(1)
+	}
+	jobStore, err := jobpostgres.New(context.Background(), databaseURL)
+	if err != nil {
+		slog.Error("connect to Postgres", slog.Any("error", err))
+		os.Exit(1)
+	}
+	defer jobStore.Close()
 
 	textGenerator := text.NewGenerator()
 	pdfGenerator := pdf.NewGenerator(textGenerator)
-	jobService := jobs.NewService(pdfGenerator, storageDir, workers)
+	jobService := jobs.NewServiceWithStore(pdfGenerator, storageDir, workers, jobStore)
 	jobHandler := jobs.NewHandler(jobService)
 
 	mux := http.NewServeMux()
