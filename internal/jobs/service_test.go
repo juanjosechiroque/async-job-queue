@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -160,6 +162,98 @@ func TestServiceRejectsJobsWhenQueueIsFull(t *testing.T) {
 	waitForTerminalJob(t, service, blocking.ID)
 	for _, job := range queued {
 		waitForTerminalJob(t, service, job.ID)
+	}
+}
+
+func TestServiceConcurrentCreateJobsRespectsQueueCapacity(t *testing.T) {
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	service := NewService(testPDFGenerator{
+		document: []byte("%PDF-test"),
+		started:  started,
+		release:  release,
+	}, t.TempDir(), 1)
+	defer func() {
+		close(release)
+		service.StopAccepting()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := service.Wait(ctx); err != nil {
+			t.Errorf("Wait() error = %v", err)
+		}
+	}()
+
+	if _, err := service.CreateJob(1); err != nil {
+		t.Fatalf("CreateJob() blocking job error = %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("blocking job did not start")
+	}
+
+	const callers = jobQueueCapacity * 2
+	start := make(chan struct{})
+	var creators sync.WaitGroup
+	var accepted atomic.Int32
+	var rejected atomic.Int32
+	var unexpected atomic.Int32
+	for range callers {
+		creators.Add(1)
+		go func() {
+			defer creators.Done()
+			<-start
+			_, err := service.CreateJob(1)
+			switch {
+			case err == nil:
+				accepted.Add(1)
+			case errors.Is(err, ErrQueueFull):
+				rejected.Add(1)
+			default:
+				unexpected.Add(1)
+			}
+		}()
+	}
+	close(start)
+	creators.Wait()
+	if got := accepted.Load(); got != jobQueueCapacity {
+		t.Errorf("accepted concurrent creates = %d, want %d", got, jobQueueCapacity)
+	}
+	if got := rejected.Load(); got != callers-jobQueueCapacity {
+		t.Errorf("queue-full errors = %d, want %d", got, callers-jobQueueCapacity)
+	}
+	if got := unexpected.Load(); got != 0 {
+		t.Errorf("unexpected CreateJob errors = %d", got)
+	}
+}
+
+func TestServiceCreateConcurrentWithStopAccepting(t *testing.T) {
+	service := NewService(testPDFGenerator{document: []byte("%PDF-test")}, t.TempDir(), 2)
+	const callers = 64
+	start := make(chan struct{})
+	var creators sync.WaitGroup
+	var unexpected atomic.Int32
+	for range callers {
+		creators.Add(1)
+		go func() {
+			defer creators.Done()
+			<-start
+			_, err := service.CreateJob(1)
+			if err != nil && !errors.Is(err, ErrShuttingDown) && !errors.Is(err, ErrQueueFull) {
+				unexpected.Add(1)
+			}
+		}()
+	}
+	close(start)
+	service.StopAccepting()
+	creators.Wait()
+	if got := unexpected.Load(); got != 0 {
+		t.Errorf("unexpected concurrent CreateJob errors = %d", got)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := service.Wait(ctx); err != nil {
+		t.Fatalf("Wait() error = %v", err)
 	}
 }
 

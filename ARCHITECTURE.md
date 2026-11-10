@@ -26,6 +26,8 @@ On `SIGINT`/`SIGTERM`:
 3. Workers stop claiming work; jobs already executing in this process finish, while queued rows remain in the store for a later process to claim.
 4. Wait up to 10s, then exit.
 
+A `CreateJob` that passes the accepting check just before shutdown may finish its Postgres insert after `StopAccepting`. That row remains `queued` and can be claimed by the next process; `Wait` only accounts for jobs claimed by this process's workers.
+
 Why 10s: shutdown waits only for jobs already in progress. At most 4 run at once, in parallel, so the wait is about one job: ~112ms for the largest (~103ms generation + ~9ms disk write), excluding Postgres round-trips. A local shutdown with jobs in flight exited in under 1s; 10s leaves ample margin for slower production I/O.
 
 Workers don't use the request context — a job keeps running after its `202` is sent.
@@ -83,7 +85,8 @@ Load: `hey -c 100 -n 100 -m POST -d '{"lines":250000}' localhost:8080/jobs`, `pp
 | Poll Postgres every 200ms, not `LISTEN/NOTIFY` | Simplest correct claim loop; also finds jobs created by other instances | Up to 200ms pickup latency; idle load of 4 workers × 5 polls/s |
 | 4 workers | Caps peak memory (93 → 10 goroutines, 703 → 85 MB above) | At most 4 concurrent generations per process |
 | `503` when the queue is full, instead of blocking | A blocked request has no bound of its own and gives the client no retry signal | Clients must retry |
-| Advisory lock on job creation | Count + insert cannot race past the 100 cap, even across processes | All job creation serializes on one lock |
+| Advisory lock on job creation | Count + insert cannot race past the 100 cap, even across processes; request goroutines do not hold the service mutex during database I/O | All job creation serializes on one database lock |
+| In-flight creation may finish after shutdown starts | The database insert is outside the service mutex; the existing Postgres transaction still enforces capacity | A final `queued` row may wait for the next process to start |
 | Socket IP, not `X-Forwarded-For` | The header is spoofable without a trusted-proxy hop count | Behind a proxy, every client looks like one IP |
 | PDFs on local disk, metadata in Postgres | Keeps large blobs out of the database | Files are not shared across instances (below) |
 
