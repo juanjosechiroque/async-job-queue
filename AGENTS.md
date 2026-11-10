@@ -14,7 +14,9 @@ This repository contains a Go HTTP service that generates PDFs asynchronously. T
 ## Current structure
 
 - `cmd/server`: server startup and dependency wiring.
-- `internal/jobs`: handler, request model, and business service.
+- `internal/jobs`: handler, request model, business service, `JobStore` interface, in-memory store.
+- `internal/postgres`: Postgres-backed `JobStore` and embedded schema.
+- `internal/ratelimit`: per-IP rate limiting middleware.
 - `internal/pdf`: PDF generation.
 - `internal/text`: per-line text generation.
 
@@ -39,7 +41,7 @@ GET  /jobs/{id}
 GET  /jobs/{id}/file
 ```
 
-`POST /job` is not implemented. Job creation returns JSON; completed PDF files are returned by `GET /jobs/{id}/file`.
+Job creation returns JSON; completed PDF files are returned by `GET /jobs/{id}/file`.
 
 ## Required verification
 
@@ -49,7 +51,7 @@ After modifying Go code:
 make check
 ```
 
-This runs `gofmt`, `go vet`, and `go test ./... -race`.
+This runs `gofmt`, `go vet`, and `go test ./... -race`. When changing `internal/postgres` or claiming logic, also run with `DATABASE_URL` set (after `docker compose up -d --wait`) so the Postgres integration test runs instead of skipping.
 
 When modifying the HTTP endpoint, verify at least:
 
