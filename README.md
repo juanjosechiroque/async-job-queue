@@ -23,6 +23,7 @@ go run ./cmd/server
 - `Ctrl+C` stops new claims, lets jobs already in progress finish (10s timeout), and leaves queued jobs for the next start.
 
 Requires Go 1.27+ and Docker Compose. Database data survives `docker compose down`; use `down -v` to wipe it.
+On startup, the server applies embedded, numbered SQL migrations automatically. The initial migration also accepts an existing development `jobs` table.
 
 ## API
 
@@ -104,7 +105,7 @@ The Postgres integration test runs when `DATABASE_URL` is set (e.g. after `docke
 ```text
 cmd/server/main.go   server startup, shutdown
 internal/jobs/       handler, service, JobStore interface, in-memory store
-internal/postgres/   pgxpool-backed JobStore and embedded schema
+internal/postgres/   pgxpool-backed JobStore and embedded SQL migrations
 internal/ratelimit/  per-IP rate limiting middleware
 internal/pdf/        PDF generation
 internal/text/       filler text
