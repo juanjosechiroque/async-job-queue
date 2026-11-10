@@ -39,7 +39,7 @@ func main() {
 
 	textGenerator := text.NewGenerator()
 	pdfGenerator := pdf.NewGenerator(textGenerator)
-	jobService := jobs.NewServiceWithStore(pdfGenerator, storageDir, workers, jobStore)
+	jobService := jobs.NewService(pdfGenerator, storageDir, workers, jobStore)
 	jobHandler := jobs.NewHandler(jobService)
 
 	mux := http.NewServeMux()

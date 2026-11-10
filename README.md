@@ -71,6 +71,8 @@ GET /jobs/{jobId}/file
 | unknown job | `404` |
 | shutting down | `503` |
 | queue full | `503` |
+| store unavailable | `500` |
+| request canceled or timed out during a store operation | `503` |
 
 No internal error detail ever reaches the client.
 
