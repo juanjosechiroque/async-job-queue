@@ -12,17 +12,21 @@ const (
 	StatusQueued     JobStatus = "queued"
 	StatusProcessing JobStatus = "processing"
 	StatusCompleted  JobStatus = "completed"
-	StatusFailed     JobStatus = "failed"
+	StatusDead       JobStatus = "dead"
 )
 
 type Job struct {
-	ID        string
-	Lines     int
-	Status    JobStatus
-	FilePath  string
-	Error     string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ID             string
+	Lines          int
+	Status         JobStatus
+	FilePath       string
+	Error          string
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+	AvailableAt    time.Time
+	LeaseExpiresAt *time.Time
+	Attempts       int
+	ClaimVersion   int64
 }
 
 type createJobResponse struct {

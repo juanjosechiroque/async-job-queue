@@ -212,7 +212,7 @@ func TestHandlerReadJob(t *testing.T) {
 			t.Fatalf("GET /jobs/{id} status = %d, want %d", recorder.Code, http.StatusOK)
 		}
 		response := decodeJSON[readJobResponse](t, recorder)
-		if response.Status != StatusFailed || response.Error != "job failed" {
+		if response.Status != StatusDead || response.Error != "job failed" {
 			t.Fatalf("GET /jobs/{id} = status %q, error %q; want failed job", response.Status, response.Error)
 		}
 		if response.DownloadURL != "" {

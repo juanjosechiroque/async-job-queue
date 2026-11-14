@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -16,6 +17,15 @@ import (
 const MaxLines = 250000
 
 const jobQueueCapacity = 100
+
+// MaxAttempts includes the first claim and both retries.
+const MaxAttempts = 3
+
+const (
+	LeaseDuration     = 30 * time.Second
+	heartbeatInterval = 10 * time.Second
+	reaperInterval    = 10 * time.Second
+)
 
 var (
 	ErrInvalidLineCount = errors.New("lines must be between 1 and 250000")
@@ -33,10 +43,26 @@ type PDFGenerator interface {
 // semantics so either can back the same Service behavior.
 type JobStore interface {
 	Get(context.Context, string) (Job, error)
-	MarkCompleted(context.Context, string, string) error
-	MarkFailed(context.Context, string, string) error
+	MarkCompleted(context.Context, string, int64, string) error
+	FailAttempt(context.Context, string, int64, string) (JobStatus, error)
 	CreateQueued(context.Context, Job, int) (bool, error)
 	ClaimQueued(context.Context) (Job, bool, error)
+	ExtendLease(context.Context, string, int64) (bool, error)
+	ReapExpired(context.Context) ([]JobTransition, error)
+}
+
+// JobTransition describes a status change made by the expired-lease reaper.
+type JobTransition struct {
+	ID     string
+	Status JobStatus
+}
+
+// RetryDelay is the wait after a failed attempt before the next claim.
+func RetryDelay(attempts int) time.Duration {
+	if attempts <= 1 {
+		return time.Second
+	}
+	return 5 * time.Second
 }
 
 // Store holds metadata only. The generated PDF remains on the filesystem.
@@ -59,10 +85,14 @@ func (s *Store) Get(ctx context.Context, id string) (Job, error) {
 	if !ok {
 		return Job{}, ErrJobNotFound
 	}
+	if job.LeaseExpiresAt != nil {
+		expires := *job.LeaseExpiresAt
+		job.LeaseExpiresAt = &expires
+	}
 	return job, nil
 }
 
-func (s *Store) update(ctx context.Context, id string, update func(*Job)) error {
+func (s *Store) update(ctx context.Context, id string, version int64, update func(*Job)) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -72,28 +102,40 @@ func (s *Store) update(ctx context.Context, id string, update func(*Job)) error 
 	if !ok {
 		return ErrJobNotFound
 	}
+	if job.Status != StatusProcessing || job.ClaimVersion != version || job.LeaseExpiresAt == nil || !job.LeaseExpiresAt.After(time.Now().UTC()) {
+		return ErrJobNotFound
+	}
 	update(&job)
 	job.UpdatedAt = time.Now().UTC()
 	s.jobs[id] = job
 	return nil
 }
 
-func (s *Store) MarkCompleted(ctx context.Context, id, path string) error {
-	return s.update(ctx, id, func(job *Job) {
+func (s *Store) MarkCompleted(ctx context.Context, id string, version int64, path string) error {
+	return s.update(ctx, id, version, func(job *Job) {
 		job.Status = StatusCompleted
 		job.FilePath = path
 		job.Error = ""
+		job.LeaseExpiresAt = nil
 	})
 }
 
-func (s *Store) MarkFailed(ctx context.Context, id, message string) error {
-	return s.update(ctx, id, func(job *Job) {
-		job.Status = StatusFailed
+func (s *Store) FailAttempt(ctx context.Context, id string, version int64, message string) (JobStatus, error) {
+	var status JobStatus
+	err := s.update(ctx, id, version, func(job *Job) {
+		status = StatusDead
+		if job.Attempts < MaxAttempts {
+			status = StatusQueued
+			job.AvailableAt = time.Now().UTC().Add(RetryDelay(job.Attempts))
+		}
+		job.Status = status
 		job.Error = message
+		job.LeaseExpiresAt = nil
 	})
+	return status, err
 }
 
-// CreateQueued creates a job only when fewer than capacity jobs are queued.
+// CreateQueued creates a job only when fewer than capacity jobs are active.
 // Holding the mutex for both operations mirrors the transactional Postgres
 // implementation and keeps the in-memory store useful in unit tests.
 func (s *Store) CreateQueued(ctx context.Context, job Job, capacity int) (bool, error) {
@@ -102,17 +144,20 @@ func (s *Store) CreateQueued(ctx context.Context, job Job, capacity int) (bool, 
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	queued := 0
+	active := 0
 	for _, existing := range s.jobs {
-		if existing.Status == StatusQueued {
-			queued++
+		if existing.Status == StatusQueued || existing.Status == StatusProcessing {
+			active++
 		}
 	}
-	if queued >= capacity {
+	if active >= capacity {
 		return false, ErrQueueFull
 	}
 	if _, exists := s.jobs[job.ID]; exists {
 		return false, nil
+	}
+	if job.AvailableAt.IsZero() {
+		job.AvailableAt = time.Now().UTC()
 	}
 	s.jobs[job.ID] = job
 	return true, nil
@@ -125,10 +170,11 @@ func (s *Store) ClaimQueued(ctx context.Context) (Job, bool, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := time.Now().UTC()
 	var selectedID string
 	var selected Job
 	for id, job := range s.jobs {
-		if job.Status == StatusQueued && (selectedID == "" || job.CreatedAt.Before(selected.CreatedAt) || (job.CreatedAt.Equal(selected.CreatedAt) && id < selectedID)) {
+		if job.Status == StatusQueued && !job.AvailableAt.After(now) && (selectedID == "" || job.CreatedAt.Before(selected.CreatedAt) || (job.CreatedAt.Equal(selected.CreatedAt) && id < selectedID)) {
 			selectedID = id
 			selected = job
 		}
@@ -137,9 +183,57 @@ func (s *Store) ClaimQueued(ctx context.Context) (Job, bool, error) {
 		return Job{}, false, nil
 	}
 	selected.Status = StatusProcessing
-	selected.UpdatedAt = time.Now().UTC()
+	selected.Attempts++
+	selected.ClaimVersion++
+	selected.Error = ""
+	selected.UpdatedAt = now
+	expires := now.Add(LeaseDuration)
+	selected.LeaseExpiresAt = &expires
 	s.jobs[selectedID] = selected
 	return selected, true, nil
+}
+
+func (s *Store) ExtendLease(ctx context.Context, id string, version int64) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job, ok := s.jobs[id]
+	if !ok || job.Status != StatusProcessing || job.ClaimVersion != version || job.LeaseExpiresAt == nil || !job.LeaseExpiresAt.After(time.Now().UTC()) {
+		return false, nil
+	}
+	now := time.Now().UTC()
+	expires := now.Add(LeaseDuration)
+	job.LeaseExpiresAt = &expires
+	job.UpdatedAt = now
+	s.jobs[id] = job
+	return true, nil
+}
+
+func (s *Store) ReapExpired(ctx context.Context) ([]JobTransition, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().UTC()
+	var transitions []JobTransition
+	for id, job := range s.jobs {
+		if job.Status == StatusProcessing && job.LeaseExpiresAt != nil && !job.LeaseExpiresAt.After(now) {
+			job.Status = StatusDead
+			if job.Attempts < MaxAttempts {
+				job.Status = StatusQueued
+				job.AvailableAt = now.Add(RetryDelay(job.Attempts))
+			}
+			job.Error = "lease expired"
+			job.LeaseExpiresAt = nil
+			job.UpdatedAt = now
+			s.jobs[id] = job
+			transitions = append(transitions, JobTransition{ID: id, Status: job.Status})
+		}
+	}
+	return transitions, nil
 }
 
 type Service struct {
@@ -179,6 +273,8 @@ func NewService(pdfGenerator PDFGenerator, storageDir string, workers int, store
 	for range workers {
 		go service.worker()
 	}
+	service.jobs.Add(1)
+	go service.reaper()
 	return service
 }
 
@@ -270,14 +366,18 @@ func (s *Service) Wait(ctx context.Context) error {
 
 func (s *Service) run(job Job) {
 	processingStarted := time.Now()
+	stopHeartbeat, lost := s.startHeartbeat(job.ID, job.ClaimVersion)
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			s.logger.Error("job panic recovered",
 				slog.String("job_id", job.ID),
 				slog.Any("panic", recovered),
 			)
-			s.markFailed(job.ID, processingStarted)
+			if !stopHeartbeat() {
+				s.failAttempt(job, fmt.Sprint(recovered), processingStarted)
+			}
 		}
+		stopHeartbeat()
 	}()
 
 	processingStarted = time.Now()
@@ -292,19 +392,33 @@ func (s *Service) run(job Job) {
 			slog.String("job_id", job.ID),
 			slog.Any("error", err),
 		)
-		s.markFailed(job.ID, processingStarted)
+		if !stopHeartbeat() {
+			s.failAttempt(job, err.Error(), processingStarted)
+		}
 		return
 	}
-	path, err := s.writePDF(job.ID, document)
+	select {
+	case <-lost:
+		return
+	default:
+	}
+	path, err := s.writePDF(job.ID, job.Attempts, document)
 	if err != nil {
 		s.logger.Error("job PDF storage failed",
 			slog.String("job_id", job.ID),
 			slog.Any("error", err),
 		)
-		s.markFailed(job.ID, processingStarted)
+		if !stopHeartbeat() {
+			s.failAttempt(job, err.Error(), processingStarted)
+		}
 		return
 	}
-	if err := s.jobStore.MarkCompleted(context.WithoutCancel(s.ctx), job.ID, path); err != nil {
+	select {
+	case <-lost:
+		return
+	default:
+	}
+	if err := s.jobStore.MarkCompleted(context.WithoutCancel(s.ctx), job.ID, job.ClaimVersion, path); err != nil {
 		s.logger.Error("job completed transition failed",
 			slog.String("job_id", job.ID),
 			slog.Any("error", err),
@@ -317,6 +431,68 @@ func (s *Service) run(job Job) {
 		slog.Duration("generation_duration", time.Since(processingStarted)),
 		slog.Int("pdf_size_bytes", len(document)),
 	)
+}
+
+func (s *Service) startHeartbeat(id string, version int64) (func() bool, <-chan struct{}) {
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+	lost := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		ticker := time.NewTicker(heartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				active, err := s.jobStore.ExtendLease(context.WithoutCancel(s.ctx), id, version)
+				if err != nil {
+					s.logger.Error("extend job lease", slog.String("job_id", id), slog.Any("error", err))
+					continue
+				}
+				if !active {
+					close(lost)
+					return
+				}
+			}
+		}
+	}()
+	var once sync.Once
+	return func() bool {
+		once.Do(func() { close(done) })
+		<-stopped
+		select {
+		case <-lost:
+			return true
+		default:
+			return false
+		}
+	}, lost
+}
+
+func (s *Service) reaper() {
+	defer s.jobs.Done()
+	ticker := time.NewTicker(reaperInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+			transitions, err := s.jobStore.ReapExpired(s.ctx)
+			if err != nil {
+				if s.ctx.Err() == nil {
+					s.logger.Error("reap expired jobs", slog.Any("error", err))
+				}
+				continue
+			}
+			s.logger.Info("reaped expired jobs", slog.Int("count", len(transitions)))
+			for _, transition := range transitions {
+				s.logger.Info("job state transition", slog.String("job_id", transition.ID), slog.String("status", string(transition.Status)))
+			}
+		}
+	}
 }
 
 func (s *Service) worker() {
@@ -354,17 +530,19 @@ func (s *Service) worker() {
 	}
 }
 
-func (s *Service) markFailed(id string, processingStarted time.Time) {
-	if err := s.jobStore.MarkFailed(context.WithoutCancel(s.ctx), id, "job failed"); err != nil {
-		s.logger.Error("job failed transition failed",
-			slog.String("job_id", id),
+func (s *Service) failAttempt(job Job, detail string, processingStarted time.Time) {
+	status, err := s.jobStore.FailAttempt(context.WithoutCancel(s.ctx), job.ID, job.ClaimVersion, detail)
+	if err != nil {
+		s.logger.Error("job failure transition failed",
+			slog.String("job_id", job.ID),
 			slog.Any("error", err),
 		)
 		return
 	}
 	s.logger.Info("job state transition",
-		slog.String("job_id", id),
-		slog.String("status", string(StatusFailed)),
+		slog.String("job_id", job.ID),
+		slog.String("status", string(status)),
+		slog.Int("attempt", job.Attempts),
 		slog.Duration("generation_duration", time.Since(processingStarted)),
 	)
 }
@@ -376,7 +554,7 @@ func (s *Service) signalWorker() {
 	}
 }
 
-func (s *Service) writePDF(id string, document []byte) (string, error) {
+func (s *Service) writePDF(id string, attempt int, document []byte) (string, error) {
 	file, err := os.CreateTemp(s.storageDir, id+"-*.tmp")
 	if err != nil {
 		return "", err
@@ -392,7 +570,7 @@ func (s *Service) writePDF(id string, document []byte) (string, error) {
 		return "", err
 	}
 
-	finalPath := filepath.Join(s.storageDir, id+".pdf")
+	finalPath := filepath.Join(s.storageDir, id+"-attempt-"+strconv.Itoa(attempt)+".pdf")
 	if err := os.Rename(temporaryPath, finalPath); err != nil {
 		return "", err
 	}

@@ -165,11 +165,11 @@ func TestStoreNotFoundAndContextErrors(t *testing.T) {
 	if _, err := store.Get(context.Background(), id); !errors.Is(err, jobs.ErrJobNotFound) {
 		t.Errorf("Get() error = %v, want ErrJobNotFound", err)
 	}
-	if err := store.MarkCompleted(context.Background(), id, "missing.pdf"); !errors.Is(err, jobs.ErrJobNotFound) {
+	if err := store.MarkCompleted(context.Background(), id, 1, "missing.pdf"); !errors.Is(err, jobs.ErrJobNotFound) {
 		t.Errorf("MarkCompleted() error = %v, want ErrJobNotFound", err)
 	}
-	if err := store.MarkFailed(context.Background(), id, "failed"); !errors.Is(err, jobs.ErrJobNotFound) {
-		t.Errorf("MarkFailed() error = %v, want ErrJobNotFound", err)
+	if _, err := store.FailAttempt(context.Background(), id, 1, "failed"); !errors.Is(err, jobs.ErrJobNotFound) {
+		t.Errorf("FailAttempt() error = %v, want ErrJobNotFound", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -344,13 +344,13 @@ func deleteJob(t *testing.T, store *Store, id string) {
 
 func waitForTerminalJob(t *testing.T, service *jobs.Service, id string) jobs.Job {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		job, err := service.GetJob(context.Background(), id)
 		if err != nil {
 			t.Fatalf("GetJob(%q) error = %v", id, err)
 		}
-		if job.Status == jobs.StatusCompleted || job.Status == jobs.StatusFailed {
+		if job.Status == jobs.StatusCompleted || job.Status == jobs.StatusDead {
 			return job
 		}
 		time.Sleep(10 * time.Millisecond)

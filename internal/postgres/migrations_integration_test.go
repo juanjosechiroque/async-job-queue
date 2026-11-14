@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/fs"
 	"net/url"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -82,10 +83,40 @@ func TestMigrationsPreexistingJobsTable(t *testing.T) {
 	)`); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := pool.Exec(context.Background(), `INSERT INTO jobs
+		(id, lines, status, created_at, updated_at)
+		VALUES ('oldfailed1', 1, 'failed', now(), now())`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(context.Background(), `INSERT INTO jobs
+		(id, lines, status, created_at, updated_at)
+		VALUES ('oldproc001', 1, 'processing', now(), now())`); err != nil {
+		t.Fatal(err)
+	}
 	store := newIntegrationStore(t, databaseURL)
 	var count int
 	if err := store.pool.QueryRow(context.Background(), "SELECT count(*) FROM schema_migrations").Scan(&count); err != nil || count != migrationCount(t) {
 		t.Fatalf("migration count = %d, error = %v", count, err)
+	}
+	var status string
+	if err := store.pool.QueryRow(context.Background(), "SELECT status FROM jobs WHERE id = 'oldfailed1'").Scan(&status); err != nil || status != "dead" {
+		t.Fatalf("legacy status = %q, error = %v; want dead", status, err)
+	}
+	var attempts int
+	var claimVersion int64
+	var leaseExpiresAt time.Time
+	if err := store.pool.QueryRow(context.Background(), `SELECT attempts, claim_version, lease_expires_at
+		FROM jobs WHERE id = 'oldproc001'`).Scan(&attempts, &claimVersion, &leaseExpiresAt); err != nil || attempts != 1 || claimVersion != 1 || leaseExpiresAt.After(time.Now()) {
+		t.Fatalf("legacy processing row = attempts %d, claim %d, lease %v, error %v", attempts, claimVersion, leaseExpiresAt, err)
+	}
+	transitions, err := store.ReapExpired(context.Background())
+	if err != nil || len(transitions) != 1 || transitions[0].ID != "oldproc001" || transitions[0].Status != "queued" {
+		t.Fatalf("legacy processing recovery = (%v, %v)", transitions, err)
+	}
+	var constraint string
+	if err := store.pool.QueryRow(context.Background(), `SELECT pg_get_constraintdef(oid) FROM pg_constraint
+		WHERE conrelid = 'jobs'::regclass AND conname = 'jobs_status_check'`).Scan(&constraint); err != nil || !strings.Contains(constraint, "dead") || strings.Contains(constraint, "failed") {
+		t.Fatalf("status constraint = %q, error = %v", constraint, err)
 	}
 }
 

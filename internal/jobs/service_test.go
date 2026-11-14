@@ -19,6 +19,125 @@ type testPDFGenerator struct {
 	release  <-chan struct{}
 }
 
+type flakyPDFGenerator struct{ calls atomic.Int32 }
+
+func (g *flakyPDFGenerator) Generate(int) ([]byte, error) {
+	if g.calls.Add(1) == 1 {
+		return nil, errors.New("temporary generation failure")
+	}
+	return []byte("%PDF-retry"), nil
+}
+
+type panicOncePDFGenerator struct{ calls atomic.Int32 }
+
+func (g *panicOncePDFGenerator) Generate(int) ([]byte, error) {
+	if g.calls.Add(1) == 1 {
+		panic("temporary panic")
+	}
+	return []byte("%PDF-retry"), nil
+}
+
+func TestServiceRetriesRecoveredPanic(t *testing.T) {
+	generator := &panicOncePDFGenerator{}
+	service := newTestService(generator, t.TempDir(), 1)
+	created, err := service.CreateJob(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed := waitForTerminalJob(t, service, created.ID)
+	if completed.Status != StatusCompleted || completed.Attempts != 2 || generator.calls.Load() != 2 {
+		t.Fatalf("retried panic = %+v, generator calls = %d", completed, generator.calls.Load())
+	}
+}
+
+func TestServiceRetriesGeneratorFailure(t *testing.T) {
+	generator := &flakyPDFGenerator{}
+	service := newTestService(generator, t.TempDir(), 1)
+	created, err := service.CreateJob(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed := waitForTerminalJob(t, service, created.ID)
+	if completed.Status != StatusCompleted || completed.Attempts != 2 || generator.calls.Load() != 2 {
+		t.Fatalf("retried job = %+v, generator calls = %d", completed, generator.calls.Load())
+	}
+	if !strings.HasSuffix(completed.FilePath, "-attempt-2.pdf") {
+		t.Fatalf("second attempt file = %q", completed.FilePath)
+	}
+}
+
+func TestServiceRetriesStorageFailure(t *testing.T) {
+	storagePath := filepath.Join(t.TempDir(), "storage")
+	if err := os.WriteFile(storagePath, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := NewStore()
+	service := NewService(testPDFGenerator{document: []byte("%PDF-retry")}, storagePath, 1, store)
+	created, err := service.CreateJob(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		job, err := store.Get(context.Background(), created.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if job.Status == StatusQueued && job.Attempts == 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	job, err := store.Get(context.Background(), created.ID)
+	if err != nil || job.Attempts != 1 || job.Status != StatusQueued {
+		t.Fatalf("first write failure = (%+v, %v)", job, err)
+	}
+	if err := os.Remove(storagePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(storagePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	completed := waitForTerminalJob(t, service, created.ID)
+	if completed.Status != StatusCompleted || completed.Attempts != 2 {
+		t.Fatalf("retried write = %+v", completed)
+	}
+}
+
+func TestMemoryStoreRejectsStaleClaimAfterRetry(t *testing.T) {
+	store := NewStore()
+	now := time.Now().UTC()
+	if created, err := store.CreateQueued(context.Background(), Job{ID: "stale00001", Status: StatusQueued, CreatedAt: now}, 1); err != nil || !created {
+		t.Fatalf("create = (%t, %v)", created, err)
+	}
+	first, claimed, err := store.ClaimQueued(context.Background())
+	if err != nil || !claimed {
+		t.Fatalf("first claim = (%+v, %t, %v)", first, claimed, err)
+	}
+	status, err := store.FailAttempt(context.Background(), first.ID, first.ClaimVersion, "first failed")
+	if err != nil || status != StatusQueued {
+		t.Fatalf("failure = (%q, %v)", status, err)
+	}
+	store.mu.Lock()
+	job := store.jobs[first.ID]
+	job.AvailableAt = time.Now().Add(-time.Second)
+	store.jobs[first.ID] = job
+	store.mu.Unlock()
+	second, claimed, err := store.ClaimQueued(context.Background())
+	if err != nil || !claimed || second.ClaimVersion <= first.ClaimVersion {
+		t.Fatalf("second claim = (%+v, %t, %v)", second, claimed, err)
+	}
+	if active, err := store.ExtendLease(context.Background(), first.ID, first.ClaimVersion); err != nil || active {
+		t.Fatalf("stale heartbeat = (%t, %v)", active, err)
+	}
+	if err := store.MarkCompleted(context.Background(), first.ID, first.ClaimVersion, "stale.pdf"); !errors.Is(err, ErrJobNotFound) {
+		t.Fatalf("stale completion = %v", err)
+	}
+	if err := store.MarkCompleted(context.Background(), second.ID, second.ClaimVersion, "current.pdf"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func newTestService(generator PDFGenerator, storageDir string, workers int) *Service {
 	return NewService(generator, storageDir, workers, NewStore())
 }
@@ -57,7 +176,7 @@ func TestServiceCompletesJobAndStoresPDF(t *testing.T) {
 	if completed.Status != StatusCompleted {
 		t.Fatalf("GetJob() status = %q, want %q", completed.Status, StatusCompleted)
 	}
-	if got, want := completed.FilePath, filepath.Join(storageDir, created.ID+".pdf"); got != want {
+	if got, want := completed.FilePath, filepath.Join(storageDir, created.ID+"-attempt-1.pdf"); got != want {
 		t.Fatalf("FilePath = %q, want %q", got, want)
 	}
 	document, err := os.ReadFile(completed.FilePath)
@@ -82,7 +201,7 @@ func TestServiceMarksGeneratorFailures(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetJob() error = %v", err)
 	}
-	if failed.Status != StatusFailed || failed.Error != "job failed" {
+	if failed.Status != StatusDead || failed.Error != "generator failed" {
 		t.Fatalf("GetJob() = status %q, error %q; want failed job", failed.Status, failed.Error)
 	}
 }
@@ -150,8 +269,8 @@ func TestServiceRejectsJobsWhenQueueIsFull(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("blocking job did not start")
 	}
-	queued := make([]Job, 0, jobQueueCapacity)
-	for range jobQueueCapacity {
+	queued := make([]Job, 0, jobQueueCapacity-1)
+	for range jobQueueCapacity - 1 {
 		job, err := service.CreateJob(context.Background(), 1)
 		if err != nil {
 			t.Fatalf("CreateJob() queued job error = %v", err)
@@ -220,11 +339,11 @@ func TestServiceConcurrentCreateJobsRespectsQueueCapacity(t *testing.T) {
 	}
 	close(start)
 	creators.Wait()
-	if got := accepted.Load(); got != jobQueueCapacity {
-		t.Errorf("accepted concurrent creates = %d, want %d", got, jobQueueCapacity)
+	if got := accepted.Load(); got != jobQueueCapacity-1 {
+		t.Errorf("accepted concurrent creates = %d, want %d", got, jobQueueCapacity-1)
 	}
-	if got := rejected.Load(); got != callers-jobQueueCapacity {
-		t.Errorf("queue-full errors = %d, want %d", got, callers-jobQueueCapacity)
+	if got := rejected.Load(); got != callers-(jobQueueCapacity-1) {
+		t.Errorf("queue-full errors = %d, want %d", got, callers-(jobQueueCapacity-1))
 	}
 	if got := unexpected.Load(); got != 0 {
 		t.Errorf("unexpected CreateJob errors = %d", got)
@@ -312,13 +431,13 @@ func TestServiceLeavesQueuedJobsAfterStopAccepting(t *testing.T) {
 
 func waitForTerminalJob(t *testing.T, service *Service, id string) Job {
 	t.Helper()
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		job, err := service.GetJob(context.Background(), id)
 		if err != nil {
 			t.Fatalf("GetJob(%q) error = %v", id, err)
 		}
-		if job.Status == StatusCompleted || job.Status == StatusFailed {
+		if job.Status == StatusCompleted || job.Status == StatusDead {
 			return job
 		}
 		time.Sleep(5 * time.Millisecond)
@@ -359,7 +478,7 @@ func TestMemoryStoreErrorsContextAndClaimOrder(t *testing.T) {
 	if _, err := store.Get(context.Background(), "missing000"); !errors.Is(err, ErrJobNotFound) {
 		t.Errorf("Get(missing) error = %v, want ErrJobNotFound", err)
 	}
-	if err := store.MarkCompleted(context.Background(), "missing000", "missing.pdf"); !errors.Is(err, ErrJobNotFound) {
+	if err := store.MarkCompleted(context.Background(), "missing000", 1, "missing.pdf"); !errors.Is(err, ErrJobNotFound) {
 		t.Errorf("MarkCompleted(missing) error = %v, want ErrJobNotFound", err)
 	}
 

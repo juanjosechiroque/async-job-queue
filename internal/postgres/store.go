@@ -59,18 +59,22 @@ func (s *Store) CreateQueued(ctx context.Context, job jobs.Job, capacity int) (b
 	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", int64(584493819274)); err != nil {
 		return false, fmt.Errorf("lock queue for create: %w", err)
 	}
-	var queued int
-	if err := tx.QueryRow(ctx, "SELECT count(*) FROM jobs WHERE status = $1", jobs.StatusQueued).Scan(&queued); err != nil {
-		return false, fmt.Errorf("count queued jobs: %w", err)
+	var active int
+	if err := tx.QueryRow(ctx, "SELECT count(*) FROM jobs WHERE status IN ('queued', 'processing')").Scan(&active); err != nil {
+		return false, fmt.Errorf("count active jobs: %w", err)
 	}
-	if queued >= capacity {
+	if active >= capacity {
 		return false, jobs.ErrQueueFull
 	}
+	var availableAt any
+	if !job.AvailableAt.IsZero() {
+		availableAt = job.AvailableAt
+	}
 	command, err := tx.Exec(ctx, `
-		INSERT INTO jobs (id, lines, status, file_path, error, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		INSERT INTO jobs (id, lines, status, file_path, error, created_at, updated_at, available_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8::timestamptz, now()))
 		ON CONFLICT (id) DO NOTHING`,
-		job.ID, job.Lines, job.Status, job.FilePath, job.Error, job.CreatedAt, job.UpdatedAt)
+		job.ID, job.Lines, job.Status, job.FilePath, job.Error, job.CreatedAt, job.UpdatedAt, availableAt)
 	if err != nil {
 		return false, fmt.Errorf("insert queued job: %w", err)
 	}
@@ -84,7 +88,7 @@ func (s *Store) Get(parent context.Context, id string) (jobs.Job, error) {
 	ctx, cancel := s.operationContext(parent)
 	defer cancel()
 	job, err := scanJob(s.pool.QueryRow(ctx, `
-		SELECT id, lines, status, file_path, error, created_at, updated_at
+		SELECT id, lines, status, file_path, error, created_at, updated_at, available_at, lease_expires_at, attempts, claim_version
 		FROM jobs WHERE id = $1`, id))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return jobs.Job{}, jobs.ErrJobNotFound
@@ -95,16 +99,38 @@ func (s *Store) Get(parent context.Context, id string) (jobs.Job, error) {
 	return job, nil
 }
 
-func (s *Store) MarkCompleted(parent context.Context, id, path string) error {
-	return s.update(parent, id, `
-		UPDATE jobs SET status = $1, file_path = $2, error = '', updated_at = $3
-		WHERE id = $4`, jobs.StatusCompleted, path, time.Now().UTC())
+func (s *Store) MarkCompleted(parent context.Context, id string, version int64, path string) error {
+	ctx, cancel := s.operationContext(parent)
+	defer cancel()
+	command, err := s.pool.Exec(ctx, `
+		UPDATE jobs SET status = 'completed', file_path = $3, error = '', updated_at = now(), lease_expires_at = NULL
+		WHERE id = $1 AND status = 'processing' AND claim_version = $2 AND lease_expires_at > now()`, id, version, path)
+	if err != nil {
+		return fmt.Errorf("complete job %s: %w", id, err)
+	}
+	if command.RowsAffected() == 0 {
+		return jobs.ErrJobNotFound
+	}
+	return nil
 }
 
-func (s *Store) MarkFailed(parent context.Context, id, message string) error {
-	return s.update(parent, id, `
-		UPDATE jobs SET status = $1, error = $2, updated_at = $3
-		WHERE id = $4`, jobs.StatusFailed, message, time.Now().UTC())
+func (s *Store) FailAttempt(parent context.Context, id string, version int64, message string) (jobs.JobStatus, error) {
+	ctx, cancel := s.operationContext(parent)
+	defer cancel()
+	var status jobs.JobStatus
+	err := s.pool.QueryRow(ctx, `UPDATE jobs SET
+		status = CASE WHEN attempts < $4 THEN 'queued' ELSE 'dead' END,
+		error = $3, updated_at = now(), lease_expires_at = NULL,
+		available_at = CASE WHEN attempts < $4 THEN now() + (CASE WHEN attempts = 1 THEN $5::int ELSE $6::int END) * interval '1 second' ELSE now() END
+		WHERE id = $1 AND status = 'processing' AND claim_version = $2 AND lease_expires_at > now()
+		RETURNING status`, id, version, message, jobs.MaxAttempts, int(jobs.RetryDelay(1)/time.Second), int(jobs.RetryDelay(2)/time.Second)).Scan(&status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", jobs.ErrJobNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("fail job %s attempt: %w", id, err)
+	}
+	return status, nil
 }
 
 // ClaimQueued uses SKIP LOCKED so one job can only be claimed by one worker,
@@ -120,9 +146,9 @@ func (s *Store) ClaimQueued(ctx context.Context) (jobs.Job, bool, error) {
 	defer tx.Rollback(ctx)
 
 	job, err := scanJob(tx.QueryRow(ctx, `
-		SELECT id, lines, status, file_path, error, created_at, updated_at
+		SELECT id, lines, status, file_path, error, created_at, updated_at, available_at, lease_expires_at, attempts, claim_version
 		FROM jobs
-		WHERE status = $1
+		WHERE status = $1 AND available_at <= now()
 		ORDER BY created_at, id
 		FOR UPDATE SKIP LOCKED
 		LIMIT 1`, jobs.StatusQueued))
@@ -136,30 +162,55 @@ func (s *Store) ClaimQueued(ctx context.Context) (jobs.Job, bool, error) {
 		return jobs.Job{}, false, fmt.Errorf("select queued job: %w", err)
 	}
 
-	now := time.Now().UTC()
-	if _, err := tx.Exec(ctx, `UPDATE jobs SET status = $1, updated_at = $2 WHERE id = $3`, jobs.StatusProcessing, now, job.ID); err != nil {
+	if err := tx.QueryRow(ctx, `UPDATE jobs SET status = $1, updated_at = now(), lease_expires_at = now() + $3 * interval '1 second',
+		attempts = attempts + 1, claim_version = claim_version + 1, error = ''
+		WHERE id = $2 RETURNING updated_at, lease_expires_at, attempts, claim_version`, jobs.StatusProcessing, job.ID, int(jobs.LeaseDuration/time.Second)).Scan(&job.UpdatedAt, &job.LeaseExpiresAt, &job.Attempts, &job.ClaimVersion); err != nil {
 		return jobs.Job{}, false, fmt.Errorf("mark claimed job processing: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return jobs.Job{}, false, fmt.Errorf("commit claimed job: %w", err)
 	}
 	job.Status = jobs.StatusProcessing
-	job.UpdatedAt = now
 	return job, true, nil
 }
 
-func (s *Store) update(parent context.Context, id, query string, values ...any) error {
+func (s *Store) ExtendLease(parent context.Context, id string, version int64) (bool, error) {
 	ctx, cancel := s.operationContext(parent)
 	defer cancel()
-	values = append(values, id)
-	command, err := s.pool.Exec(ctx, query, values...)
+	command, err := s.pool.Exec(ctx, `UPDATE jobs SET lease_expires_at = now() + $3 * interval '1 second', updated_at = now()
+		WHERE id = $1 AND status = 'processing' AND claim_version = $2 AND lease_expires_at > now()`, id, version, int(jobs.LeaseDuration/time.Second))
 	if err != nil {
-		return fmt.Errorf("update job %s: %w", id, err)
+		return false, fmt.Errorf("extend job %s lease: %w", id, err)
 	}
-	if command.RowsAffected() == 0 {
-		return jobs.ErrJobNotFound
+	return command.RowsAffected() == 1, nil
+}
+
+func (s *Store) ReapExpired(parent context.Context) ([]jobs.JobTransition, error) {
+	ctx, cancel := s.operationContext(parent)
+	defer cancel()
+	rows, err := s.pool.Query(ctx, `UPDATE jobs SET
+		status = CASE WHEN attempts < $1 THEN 'queued' ELSE 'dead' END,
+		error = 'lease expired', lease_expires_at = NULL, updated_at = now(),
+		available_at = CASE WHEN attempts < $1 THEN now() + (CASE WHEN attempts = 1 THEN $2::int ELSE $3::int END) * interval '1 second' ELSE now() END
+		WHERE id IN (SELECT id FROM jobs WHERE status = 'processing'
+			AND lease_expires_at <= now() FOR UPDATE SKIP LOCKED)
+		RETURNING id, status`, jobs.MaxAttempts, int(jobs.RetryDelay(1)/time.Second), int(jobs.RetryDelay(2)/time.Second))
+	if err != nil {
+		return nil, fmt.Errorf("reap expired jobs: %w", err)
 	}
-	return nil
+	defer rows.Close()
+	var transitions []jobs.JobTransition
+	for rows.Next() {
+		var transition jobs.JobTransition
+		if err := rows.Scan(&transition.ID, &transition.Status); err != nil {
+			return nil, fmt.Errorf("scan reaped job: %w", err)
+		}
+		transitions = append(transitions, transition)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read reaped jobs: %w", err)
+	}
+	return transitions, nil
 }
 
 func (s *Store) operationContext(parent context.Context) (context.Context, context.CancelFunc) {
@@ -172,6 +223,6 @@ type rowScanner interface {
 
 func scanJob(row rowScanner) (jobs.Job, error) {
 	var job jobs.Job
-	err := row.Scan(&job.ID, &job.Lines, &job.Status, &job.FilePath, &job.Error, &job.CreatedAt, &job.UpdatedAt)
+	err := row.Scan(&job.ID, &job.Lines, &job.Status, &job.FilePath, &job.Error, &job.CreatedAt, &job.UpdatedAt, &job.AvailableAt, &job.LeaseExpiresAt, &job.Attempts, &job.ClaimVersion)
 	return job, err
 }

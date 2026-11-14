@@ -110,7 +110,7 @@ func (h *Handler) readJob(w http.ResponseWriter, r *http.Request, id string) {
 	if job.Status == StatusCompleted {
 		response.DownloadURL = downloadURL(job.ID)
 	}
-	if job.Status == StatusFailed {
+	if job.Status == StatusDead {
 		response.Error = "job failed"
 	}
 	writeJSON(w, http.StatusOK, response)
@@ -136,7 +136,7 @@ func (h *Handler) downloadFile(w http.ResponseWriter, r *http.Request, id string
 		writeJSONError(w, http.StatusConflict, "job is queued")
 	case StatusProcessing:
 		writeJSONError(w, http.StatusConflict, "job is still being processed")
-	case StatusFailed:
+	case StatusDead:
 		writeJSONError(w, http.StatusInternalServerError, "job failed")
 	case StatusCompleted:
 		file, err := os.Open(job.FilePath)
