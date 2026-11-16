@@ -10,15 +10,17 @@ Client
   v
 :8080 -> rate limiter (10/IP/min, 100/IP/hour) -> Handler -> Service -> Postgres jobs table
                                                                   |
-                                                  4 polling workers claim queued rows
+                                                  4 polling workers claim ready queued rows
                                                   (FOR UPDATE SKIP LOCKED; 200ms idle poll)
                                                                   |
-                                                        PDF generator -> ./storage/{id}.pdf
+                                                        PDF generator -> ./storage/{id}-attempt-{n}.pdf
 ```
 
 ## Startup / shutdown
 
 `cmd/server/main.go` wires dependencies and runs two servers: `:8080` (API) and `127.0.0.1:6060` (pprof, never public). `DATABASE_URL` is required; startup fails fast if it is missing or the Postgres connection/migrations fail. `postgres.New` applies embedded, numbered SQL migrations in version order at startup. A session advisory lock serializes concurrent starts; each pending migration and its `schema_migrations` record commit in one transaction. Repeated starts leave applied versions unchanged. The initial migration accepts an existing development `jobs` table.
+
+Migration 0003 requires stopping older worker processes before deploying the new binary. Older binaries do not send claim versions in their terminal writes, so a rolling mixed-version deployment is unsafe.
 
 On `SIGINT`/`SIGTERM`:
 1. Stop accepting new jobs.
@@ -30,7 +32,7 @@ A `CreateJob` that passes the accepting check just before shutdown may finish it
 
 Why 10s: shutdown waits only for jobs already in progress. At most 4 run at once, in parallel, so the wait is about one job: ~112ms for the largest (~103ms generation + ~9ms disk write), excluding Postgres round-trips. A local shutdown with jobs in flight exited in under 1s; 10s leaves ample margin for slower production I/O.
 
-Workers don't use the request context — a job keeps running after its `202` is sent. Polling and claiming use a service lifetime context canceled at shutdown. Once a job is claimed, its generation is not canceled, and final `completed`/`failed` writes use a context detached from shutdown cancellation; the Postgres store still limits each operation to five seconds so those writes can finish during the shutdown wait window.
+Workers don't use the request context — a job keeps running after its `202` is sent. Polling, claiming, and reaping use a service lifetime context canceled at shutdown. Once a job is claimed, its generation is not canceled, and heartbeat and final `completed`/`dead` writes use a context detached from shutdown cancellation; the Postgres store still limits each operation to five seconds so those writes can finish during the shutdown wait window. The reaper stops on shutdown and participates in `Wait`; no lease is released explicitly.
 
 ## Rate limiting
 
@@ -42,22 +44,28 @@ Workers don't use the request context — a job keeps running after its `202` is
 type Job struct {
     ID, FilePath, Error string
     Lines                int
-    Status               JobStatus // queued -> processing -> completed | failed
+    Status               JobStatus // queued -> processing -> completed | queued (retry) | dead
     CreatedAt, UpdatedAt time.Time
+    AvailableAt          time.Time
+    LeaseExpiresAt       *time.Time
+    Attempts             int
+    ClaimVersion         int64
 }
 ```
 
-`jobs.JobStore` abstracts metadata storage with context-aware operations and explicit errors: `postgres.Store` (pgxpool) in the server, `jobs.Store` (in-memory) for fast unit tests. A missing row is `ErrJobNotFound`; database errors remain errors and are not treated as missing jobs. The initial embedded migration creates the `jobs` table and a `(status, created_at)` index matching the claim query. PDF bytes never live in the record.
+`jobs.JobStore` abstracts metadata storage with context-aware operations and explicit errors: `postgres.Store` (pgxpool) in the server, `jobs.Store` (in-memory) for fast unit tests. A missing row is `ErrJobNotFound`; database errors remain errors and are not treated as missing jobs. The initial embedded migration creates the `jobs` table; migration 0002 adds leases and the `dead` status; migration 0003 adds attempt counts, claim versions, and retry readiness. Existing `processing` rows without a lease receive an expired lease so the reaper can recover them. PDF bytes never live in the record.
 
 ID: 10-char Base62, `crypto/rand`, collision-checked on insert.
 
-Write path: generate -> temp file -> atomic rename -> mark `completed`. A partial PDF is never servable. Worker panics are recovered and the job is marked `failed`; error detail is logged, never returned to the client.
+Write path: generate -> attempt-specific temp file -> atomic rename -> mark `completed`. A partial PDF is never servable, and a stale worker cannot overwrite a later attempt's file. Generation errors, write errors, and recovered panics requeue the job after 1s or 5s; the third failure marks it `dead`. Internal detail is stored in `jobs.error` and never returned to the client. The API reports a waiting retry as `queued` and a dead job with generic `job failed`.
 
 ## Concurrency
 
 4 workers per process poll Postgres (every 200ms while idle; woken immediately by jobs created in the same process) and claim a row with `SELECT ... FOR UPDATE SKIP LOCKED`, setting it to `processing` in the same transaction. At most 4 generations run at once per process. A row locked by one claimant is skipped by the others — across workers and across processes.
 
-`CreateJob` counts queued rows and inserts in one transaction under an advisory lock. At 100 queued it returns `ErrQueueFull` (`503`) and persists nothing.
+`CreateJob` counts all nonterminal (`queued` and `processing`) rows and inserts in one transaction under an advisory lock. At 100 active jobs it returns `ErrQueueFull` (`503`) and persists nothing. This leaves room for internal retries without exceeding the limit.
+
+Claiming increments `attempts` and `claim_version` and sets `lease_expires_at` to 30 seconds after the database clock's current time. A heartbeat extends it every 10 seconds while the worker processes the job. Heartbeats and final writes require the current claim version and an unexpired lease. One reaper goroutine per process runs every 10 seconds and atomically requeues expired `processing` rows using `FOR UPDATE SKIP LOCKED`, or marks them `dead` after three attempts. Competing reapers skip locked rows. A failed attempt is regenerated from scratch; queued retries become claimable after 1s, then 5s. A worker that resumes after losing its lease cannot complete or renew an obsolete attempt.
 
 ## Observability
 
@@ -84,7 +92,7 @@ Load: `hey -c 100 -n 100 -m POST -d '{"lines":250000}' localhost:8080/jobs`, `pp
 |---|---|---|
 | Poll Postgres every 200ms, not `LISTEN/NOTIFY` | Simplest correct claim loop; also finds jobs created by other instances | Up to 200ms pickup latency; idle load of 4 workers × 5 polls/s |
 | 4 workers | Caps peak memory (93 → 10 goroutines, 703 → 85 MB above) | At most 4 concurrent generations per process |
-| `503` when the queue is full, instead of blocking | A blocked request has no bound of its own and gives the client no retry signal | Clients must retry |
+| `503` when 100 jobs are active, instead of blocking | A blocked request has no bound of its own and gives the client no retry signal; internal retries stay within the cap | Clients must retry |
 | Advisory lock on job creation | Count + insert cannot race past the 100 cap, even across processes; request goroutines do not hold the service mutex during database I/O | All job creation serializes on one database lock |
 | In-flight creation may finish after shutdown starts | The database insert is outside the service mutex; the existing Postgres transaction still enforces capacity | A final `queued` row may wait for the next process to start |
 | Final job-state writes detach from shutdown cancellation | A claimed job continues to completion and its final database update can finish while `Wait` is active; each Postgres operation remains capped at five seconds | Shutdown may wait for an in-flight store write until its operation timeout |
@@ -94,7 +102,7 @@ Load: `hey -c 100 -n 100 -m POST -d '{"lines":250000}' localhost:8080/jobs`, `pp
 ## Known limitations
 
 - **Downloads are per-instance.** Claiming is safe across instances, but each instance writes PDFs to its own `storage/`, so `GET /jobs/{id}/file` returns `500` on any instance that didn't generate the file. Multi-instance needs shared storage.
-- **No recovery of `processing` jobs.** If a process dies, or the shutdown deadline expires, mid-job, the row stays `processing` — there is no lease or requeue.
+- **Retries regenerate the entire PDF.** A process crash or failed attempt may leave an unreferenced local PDF. After three failed attempts the job is `dead`; there is no manual retry endpoint.
 - **No retention.** PDFs and job records grow without bound; cleanup is out of scope.
 - **Unvalidated numbers.** The queue cap (100) and rate limits (10/min, 100/hour) are starting values. Generation takes ~100ms at worst, too fast to pressure-test them; a slower workload needs re-measuring.
 - **The rate limiter is per-process** and resets on restart.
