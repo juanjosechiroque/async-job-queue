@@ -8,7 +8,7 @@ The workload models report/invoice generation — `lines` stands in for how much
 
 ## Status
 
-Postgres-backed job metadata, 4 polling workers, 100-job bounded queue (`503` when full), per-IP rate limit on job creation (10/min, 100/hour, `429` beyond). No file or record cleanup. Design, measurements, and known limitations: [ARCHITECTURE.md](ARCHITECTURE.md).
+Postgres-backed job metadata, 4 polling workers, 100 active-job limit (`503` when full), per-IP rate limit on job creation (10/min, 100/hour, `429` beyond). Processing jobs have a 30s lease extended every 10s. Interrupted and failed attempts are retried up to 3 total attempts; exhausted jobs become `dead`. No file or record cleanup. Design, measurements, and known limitations: [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Run
 
@@ -24,6 +24,7 @@ go run ./cmd/server
 
 Requires Go 1.27+ and Docker Compose. Database data survives `docker compose down`; use `down -v` to wipe it.
 On startup, the server applies embedded, numbered SQL migrations automatically. The initial migration also accepts an existing development `jobs` table.
+Stop older server processes before deploying the retry migration; mixed-version workers are not supported during this upgrade.
 
 ## API
 
@@ -46,7 +47,7 @@ POST /jobs
 GET /jobs/{jobId}
 ```
 
-Completed jobs include `downloadUrl`; failed jobs include `error`.
+Completed jobs include `downloadUrl`; dead jobs include the generic public `error` message `job failed`. The status values are `queued`, `processing`, `completed`, and `dead`. A job waiting for another attempt appears as `queued`.
 
 **Download**
 
@@ -58,7 +59,7 @@ GET /jobs/{jobId}/file
 |---|---:|---|
 | `queued` / `processing` | `409` | job not ready |
 | `completed` | `200` | PDF |
-| `failed` | `500` | `{"error":"job failed"}` |
+| `dead` | `500` | `{"error":"job failed"}` |
 | unknown ID | `404` | `{"error":"job not found"}` |
 
 **Errors**
@@ -87,10 +88,10 @@ curl localhost:8080/jobs/{id}/file -o result.pdf
 
 ## Notes
 
-- Job records persist across restarts. Workers claim rows with `FOR UPDATE SKIP LOCKED`, so no job is processed twice, even across instances. Running several instances has caveats — see Known limitations in [ARCHITECTURE.md](ARCHITECTURE.md).
+- Job records persist across restarts. Workers claim rows with `FOR UPDATE SKIP LOCKED`; expired leases, generation errors, write errors, and panics retry after 1s and 5s, then become `dead` after the third failed attempt. Running several instances has caveats — see Known limitations in [ARCHITECTURE.md](ARCHITECTURE.md).
 - PDFs are files under `storage/`. There is no retention or cleanup for files or records.
 - No idempotency: identical requests create separate jobs.
-- PDFs are written atomically (temp file + rename), so a partial file is never served.
+- PDFs are written atomically (temp file + rename) to attempt-specific paths, so a partial or stale-attempt file is never served.
 
 ## Verify
 
